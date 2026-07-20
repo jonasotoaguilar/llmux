@@ -1,0 +1,47 @@
+# Dependabot configuration — DEFERRED
+#
+# Dependabot is not configured at this stage because the repository contains
+# no application code, package manifests, or dependency files yet
+# (no package.json, pyproject.toml, Dockerfile, or similar).
+#
+# Once the following manifests exist, uncomment the appropriate ecosystem blocks:
+#
+# --- Python (Backend) ---
+# version: 2
+# updates:
+#   - package-ecosystem: "pip"
+#     directory: "/backend"
+#     schedule:
+#       interval: "weekly"
+#     open-pull-requests-limit: 10
+#     labels:
+#       - "dependencies"
+#       - "type:chore"
+#
+# --- Node.js (Dashboard) ---
+#   - package-ecosystem: "npm"
+#     directory: "/dashboard"
+#     schedule:
+#       interval: "weekly"
+#     open-pull-requests-limit: 10
+#     labels:
+#       - "dependencies"
+#       - "type:chore"
+#
+# --- Docker ---
+#   - package-ecosystem: "docker"
+#     directory: "/"
+#     schedule:
+#       interval: "weekly"
+#     labels:
+#       - "dependencies"
+#       - "type:chore"
+#
+# --- GitHub Actions ---
+#   - package-ecosystem: "github-actions"
+#     directory: "/"
+#     schedule:
+#       interval: "weekly"
+#     labels:
+#       - "dependencies"
+#       - "type:chore"
