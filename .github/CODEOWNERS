@@ -1,0 +1,16 @@
+# CODEOWNERS — LLMux
+
+# Default owner for all files
+* @jonasotoaguilar
+
+# Architecture and design docs
+ARCHITECTURE.md @jonasotoaguilar
+DESIGN.md @jonasotoaguilar
+PRD.md @jonasotoaguilar
+docs/adr/ @jonasotoaguilar
+
+# Security policy
+SECURITY.md @jonasotoaguilar
+
+# GitHub configuration
+.github/ @jonasotoaguilar
