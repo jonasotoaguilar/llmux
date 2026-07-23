@@ -12,12 +12,22 @@ Thanks for your interest in LLMux. This document outlines the contribution workf
 
 ## Development Setup
 
-LLMux is in planning phase — the development setup will be documented when implementation begins. Expected stack:
+The backend uses `uv` to manage Python 3.12+ dependencies and runtime. Three commands cover the core loop:
 
-- **Backend**: Python 3.12+, FastAPI, Poetry/uv for dependency management
-- **Dashboard**: Node.js 22+, Next.js, TypeScript
-- **Database**: PostgreSQL 16+, Redis 7+
-- **Containers**: Docker Compose for local development
+```bash
+# 1. Install dependencies (uses committed uv.lock for reproducible installs)
+uv sync --frozen --all-groups
+
+# 2. Run the test suite (pytest with 90% coverage gate)
+uv run pytest -q --cov=llmux --cov-fail-under=90
+
+# 3. Launch the gateway locally (defaults: 0.0.0.0:8000)
+uv run uvicorn llmux.main:app --reload
+```
+
+Backend stack: Python 3.12+, FastAPI, Pydantic v2, OpenTelemetry. Lint with `uv run ruff check .`, format with `uv run ruff format .`, type-check with `uv run mypy src tests`.
+
+Dashboard and persistence layers (Next.js, PostgreSQL, Redis) are not in this slice — see ROADMAP.md for follow-up work.
 
 ## Branch Naming
 

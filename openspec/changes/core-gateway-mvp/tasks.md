@@ -33,7 +33,7 @@ Chain strategy: stacked-to-main
 - [x] 1.2 Generate `uv.lock` via `uv lock` (committed; **excluded** from authored count)
 - [x] 1.3 Create `ruff.toml` (line-length, target py312, isort groups)
 - [x] 1.4 Create `.env.example` listing `LLMUX_HOST`/`PORT`/`VERSION`/`PROVIDERS_CONFIGURED`/`OTEL_SERVICE_NAME`/`OTEL_EXPORTER_OTLP_ENDPOINT`
-- [ ] 1.5 *(droppable on >400-line pressure)* `Dockerfile` (python:3.12-slim, `uv sync --frozen`, uvicorn entrypoint)
+- [x] 1.5 *(droppable on >400-line pressure)* `Dockerfile` (python:3.12-slim, `uv sync --frozen`, uvicorn entrypoint)
 
 ## Phase 2: Provider Port (strict TDD — first RED→GREEN→REFACTOR)
 
@@ -65,9 +65,9 @@ Each row: RED failing test → GREEN production code → REFACTOR clean typing.
 
 ## Phase 6: CI + Config/ADR/Docs Deltas
 
-- [ ] 6.1 Create `.github/workflows/ci.yml`: `uv sync --frozen` → `ruff check .` → `mypy src` → `pytest -q --cov=llmux --cov-fail-under=90`
-- [ ] 6.2 Flip `openspec/config.yaml` (`strict_tdd: true`, `detected_runner: pytest`, `test_command`, `coverage_threshold: 90`); update `context:` block
-- [ ] 6.3 Flip ADR-0001 status: `Proposed` → `Accepted`
-- [ ] 6.4 Flip ADR-0002 status: `Proposed` → `Accepted`
-- [ ] 6.5 Append `CONTRIBUTING.md` Development Setup block (3 commands: `uv sync` / `uv run pytest` / `uv run uvicorn llmux.main:app`)
-- [ ] 6.6 Append §6 forecast note to `openspec/changes/core-gateway-mvp/exploration.md`: 501 chat + empty `/v1/models` are contract-correct stubs, not Phase-1 closure (cross-ref proposal Acceptance Boundary)
+- [x] 6.1 Create `.github/workflows/ci.yml`: `uv sync --frozen` → `ruff check .` → `mypy src` → `pytest -q --cov=llmux --cov-fail-under=90`
+- [x] 6.2 Flip `openspec/config.yaml` (`strict_tdd: true`, `detected_runner: pytest`, `test_command`, `coverage_threshold: 90`); update `context:` block
+- [x] 6.3 Flip ADR-0001 status: `Proposed` → `Accepted`
+- [x] 6.4 Flip ADR-0002 status: `Proposed` → `Accepted`
+- [x] 6.5 Append `CONTRIBUTING.md` Development Setup block (3 commands: `uv sync` / `uv run pytest` / `uv run uvicorn llmux.main:app`)
+- [x] 6.6 Append §6 forecast note to `openspec/changes/core-gateway-mvp/exploration.md`: 501 chat + empty `/v1/models` are contract-correct stubs, not Phase-1 closure (cross-ref proposal Acceptance Boundary)

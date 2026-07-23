@@ -6,25 +6,25 @@ schema: spec-driven
 
 context: |
   Project: llmux (self-hosted multi-provider LLM gateway with OpenAI-compatible API)
-  Branch: feat/core-gateway-mvp
-  Stage: pre-implementation — no application code committed yet
-  Stack: NOT detected (no package.json, pyproject.toml, go.mod, etc.)
-  Planned topology: modular monolith (hexagonal) + Next.js admin dashboard per ADR-0001
-  Planned storage: PostgreSQL for usage/config/keys (per ADR-0002)
+  Branch: ci/core-gateway-activation (base: feat/core-gateway-mvp)
+  Stage: core gateway MVP activation — runtime + API merged, CI + ADRs activating
+  Stack: Python 3.12, FastAPI, Pydantic v2, OpenTelemetry (api+sdk+otlp-http), uv
+  Topology: modular monolith (hexagonal) + Next.js admin dashboard per ADR-0001
+  Storage: PostgreSQL for usage/config/keys (per ADR-0002) — not in this slice
   Architecture docs: ARCHITECTURE.md, DESIGN.md, PRD.md, ROADMAP.md, docs/adr/*
-  Testing tooling: NONE detected — strict_tdd disabled until runner exists
+  Testing tooling: pytest + pytest-cov + Ruff + mypy; strict_tdd now enabled
   Style: docs-first; ADRs captured under docs/adr/ as decisions are made
 
-strict_tdd: false
+strict_tdd: true
 
 testing:
-  strict_tdd: false
-  detected_runner: none
-  detected_linter: none
-  detected_type_checker: none
-  detected_formatter: none
-  coverage_available: false
-  reason: "No package manifest or test runner present. Enable once backend/dashboard manifests exist; recommend pytest+pytest-cov for backend and vitest+@testing-library for the Next.js dashboard."
+  strict_tdd: true
+  detected_runner: pytest
+  detected_linter: ruff
+  detected_type_checker: mypy
+  detected_formatter: ruff
+  coverage_available: true
+  reason: "uv-managed backend on Python 3.12; pytest with pytest-cov enforces 90% coverage; Ruff for lint+format; mypy strict."
 
 rules:
   proposal:
@@ -47,13 +47,13 @@ rules:
     guidelines:
       - Follow existing patterns in docs/adr/ and root-level design docs
       - Do not introduce new dependencies without a design note
-    tdd: false
-    test_command: ""
-    build_command: ""
+    tdd: true
+    test_command: "uv run pytest -q --cov=llmux --cov-fail-under=90"
+    build_command: "uv sync --frozen --all-groups"
   verify:
-    test_command: ""
-    build_command: ""
-    coverage_threshold: 0
+    test_command: "uv run pytest -q --cov=llmux --cov-fail-under=90"
+    build_command: "uv run ruff check . && uv run mypy src tests"
+    coverage_threshold: 90
   archive:
     - Warn before merging any delta marked (planned) that has not been implemented
     - Preserve ADR cross-references in archived change folders
