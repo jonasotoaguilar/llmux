@@ -1,4 +1,4 @@
-# Apply Progress: Core Gateway MVP — Unit 2, First Slice (Runtime)
+# Apply Progress: Core Gateway MVP — Full Unit 2 (Runtime + API)
 
 ## Change
 
@@ -166,9 +166,44 @@ Remote parent confirmed: contains Unit 1 via merged PR #4 (`dd2ecf2`).
 
 ## Restore Instructions (Child Slice)
 
-```bash
-# On the child branch (feat/core-gateway-api or similar):
-tar xzf /tmp/opencode/llmux-api-slice.tar.gz -C /home/jona/projects/llmux
-# Then restore test_unit_2.py (replaces the runtime-only version):
-cp -a /tmp/opencode/api-slice-repack/tests/test_unit_2.py tests/test_unit_2.py
-```
+---
+
+## API Slice (restored onto runtime foundation)
+
+### Status
+
+**19/19 tasks complete** in the full merge (Phases 1–2 prior, Phase 3 runtime, Phase 4–5 API slice). Parent retains `config.py` and `observability/tracing.py` — not reintroduced.
+
+### API Files Applied
+
+| File | Lines | What |
+|------|-------|------|
+| `src/llmux/api/chat.py` | 38 | `POST /v1/chat/completions` 501 stub, `ChatMessage`/`ChatCompletionRequest`, single code path, no-fake-SSE |
+| `src/llmux/api/health.py` | 17 | `GET /v1/health` gateway-native: `status`/`version`/`providers_configured` from `app.state.settings` |
+| `src/llmux/api/models.py` | 12 | `GET /v1/models` OpenAI `{object:"list", data:[]}` |
+| `src/llmux/main.py` | 34 | `create_app(settings)` factory: resolve Settings → store on state → mount `/v1/*` → wire OTel lifespan → export `app` |
+| `tests/conftest.py` | 31 | `app` fixture + `client` fixture (TestClient) |
+| `tests/test_unit_2.py` | 188 | Merged: **16 tests** (3 Settings + 3 Tracing + 2 health + 1 models + 1×3 chat + 3 app factory + 1 conftest) |
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `uv run pytest tests/test_unit_2.py -q` | 16 passed |
+| `uv run pytest -q` | 27 passed (11 Unit 1 + 16 Unit 2) |
+| `uv run pytest -q --cov=llmux --cov-fail-under=90` | 27 passed, 98% |
+| `uv run ruff format . && ruff check .` | All checks passed |
+| `uv run mypy src tests` | Success: 14 source files |
+| `uv run uvicorn llmux.main:app` | `/v1/health` 200, `/v1/models` 200, `/v1/chat/completions` 501 (identical both stream modes) |
+
+### Rollback (candidate only)
+Drop `src/llmux/main.py`, `src/llmux/api/`, `tests/conftest.py`; revert `tests/test_unit_2.py` to runtime-only parent (101-line version). `src/llmux/config.py` and `src/llmux/observability/` are preserved — they belong to the parent runtime slice, not the candidate.
+
+### Delta vs `origin/feat/core-gateway-mvp`
+| Source | + | − | Δ |
+|--------|---|---|---|
+| `apply-progress.md` (this section) | 0 | 0 | 0 |
+| `tasks.md` | 8 | 8 | 16 |
+| `test_unit_2.py` (101→188) | 91 | 4 | 95 |
+| New API files (6) | 132 | 0 | 132 |
+| **Total** | **231** | **12** | **243** |

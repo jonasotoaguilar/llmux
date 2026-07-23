@@ -21,8 +21,8 @@ Chain strategy: stacked-to-main
 
 | Unit | Goal | Likely PR | Focused test command | Runtime harness | Rollback boundary |
 |------|------|-----------|----------------------|-----------------|-------------------|
-| 1 | Tooling + provider port (TDD loop established) | PR #1 → main | `uv run pytest tests/core -q` green, ≥5 tests | `uv run pytest -q` exit 0 | Drop `pyproject.toml`, `uv.lock`, `ruff.toml`, `.env.example`, `src/llmux/__init__.py`, `src/llmux/core/__init__.py`, `src/llmux/core/providers/__init__.py`, `src/llmux/core/providers/base.py`, `tests/core/*` (no `tests/conftest.py` — Unit 2/app factory) |
-| 2 | API routes + factory + observability | PR #2 → main | `uv run pytest -q --cov=llmux --cov-fail-under=90` green, ≥11 tests | `uv run uvicorn llmux.main:app` + `curl -i :8000/v1/health` → 200 JSON | Drop `src/llmux/{main,config}.py`, `src/llmux/api/*`, `src/llmux/observability/tracing.py`, `tests/api/*` |
+| 1 | Tooling + provider port (TDD loop established) | PR #1 (merged) | `uv run pytest tests/core -q` green, ≥5 tests | `uv run pytest -q` exit 0 | Drop `pyproject.toml`, `uv.lock`, `ruff.toml`, `.env.example`, `src/llmux/__init__.py`, `src/llmux/core/__init__.py`, `src/llmux/core/providers/__init__.py`, `src/llmux/core/providers/base.py`, `tests/core/*` |
+| 2 | API routes + factory + observability | PR #2 (merged) | `uv run pytest -q --cov=llmux --cov-fail-under=90` green, ≥16 tests | `uv run uvicorn llmux.main:app` + `curl -i :8000/v1/health` → 200 JSON | Drop `src/llmux/main.py`, `src/llmux/api/*`, `src/llmux/config.py`, `src/llmux/observability/tracing.py`, `tests/conftest.py`, `tests/test_unit_2.py` |
 | 3 | CI + config/ADR/docs deltas | PR #3 → main | `ruff check . && mypy src && pytest -q` green locally | Push branch → `.github/workflows/ci.yml` green | Drop `.github/workflows/ci.yml`, `openspec/config.yaml` flips, ADR-0001/0002 status lines, `CONTRIBUTING.md` setup block, exploration §6 note |
 
 > First apply batch (PR #1) is viable standalone: bootstraps `uv run pytest`, exercises strict TDD, ships no fake Phase-1 closure.
@@ -53,15 +53,15 @@ Each row: RED failing test → GREEN production code → REFACTOR clean typing.
 
 ## Phase 4: API Routes (strict TDD)
 
-- [ ] 4.1 TDD row — `GET /v1/health`: RED 200 + exact `{status, version, providers_configured}` JSON, gateway-native (not OpenAI) → GREEN `src/llmux/api/health.py` → REFACTOR
-- [ ] 4.2 TDD row — `GET /v1/models`: RED 200 + `{object:"list", data:[]}` envelope → GREEN `src/llmux/api/models.py` static list → REFACTOR
-- [ ] 4.3 TDD row — `POST /v1/chat/completions` 501 (stream=false): RED 501 + OpenAI error envelope + `application/json` (not `text/event-stream`) → GREEN `src/llmux/api/chat.py` + `ChatMessage`/`ChatCompletionRequest` Pydantic models → REFACTOR
-- [ ] 4.4 TDD row — chat 501 identical for `stream=true` and `stream`-omitted: RED all three stream cases produce identical body, content-type, no `data:` SSE → GREEN confirm single code path → REFACTOR
+- [x] 4.1 TDD row — `GET /v1/health`: RED 200 + exact `{status, version, providers_configured}` JSON, gateway-native (not OpenAI) → GREEN `src/llmux/api/health.py` → REFACTOR
+- [x] 4.2 TDD row — `GET /v1/models`: RED 200 + `{object:"list", data:[]}` envelope → GREEN `src/llmux/api/models.py` static list → REFACTOR
+- [x] 4.3 TDD row — `POST /v1/chat/completions` 501 (stream=false): RED 501 + OpenAI error envelope + `application/json` (not `text/event-stream`) → GREEN `src/llmux/api/chat.py` + `ChatMessage`/`ChatCompletionRequest` Pydantic models → REFACTOR
+- [x] 4.4 TDD row — chat 501 identical for `stream=true` and `stream`-omitted: RED all three stream cases produce identical body, content-type, no `data:` SSE → GREEN confirm single code path → REFACTOR
 
 ## Phase 5: App Factory + Test Harness
 
-- [ ] 5.1 TDD row — `create_app` + `app` export: RED all three `/v1` paths reachable via TestClient + OTel lifespan shutdown hook fires → GREEN `src/llmux/main.py` resolves Settings → stores on `app.state` → mounts `/v1` → wires tracing lifespan → exports `app = create_app()` → REFACTOR
-- [ ] 5.2 Create `tests/conftest.py` with `client` fixture (FastAPI TestClient) and ASGI-boundary helpers
+- [x] 5.1 TDD row — `create_app` + `app` export: RED all three `/v1` paths reachable via TestClient + OTel lifespan shutdown hook fires → GREEN `src/llmux/main.py` resolves Settings → stores on `app.state` → mounts `/v1` → wires tracing lifespan → exports `app = create_app()` → REFACTOR
+- [x] 5.2 Create `tests/conftest.py` with `client` fixture (FastAPI TestClient) and ASGI-boundary helpers
 
 ## Phase 6: CI + Config/ADR/Docs Deltas
 
