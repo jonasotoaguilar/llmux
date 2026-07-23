@@ -154,6 +154,19 @@ These are all in forecast §6.
 
 ## 6. Forecast: subsequent slices (chained-PR strategy)
 
+> **Activation note (added in Unit 3 / `ci/core-gateway-activation`):**
+> The 501 response on `POST /v1/chat/completions` and the empty `data` array on
+> `GET /v1/models` are **contract-correct stubs**, not features. They lock the
+> OpenAI-compatible wire shape (per design.md) so that the first real provider
+> adapter (forecast slice 5) can land behind them without changing the HTTP
+> surface. Neither stub closes a ROADMAP Phase 1 milestone. See
+> `proposal.md` → Acceptance Boundary for the explicit out-of-scope list
+> (real providers, streaming, auth, persistence, metering, admin, Docker
+> Compose, architecture-fitness tests). This forecast section remains the
+> authoritative chained-PR roadmap; the tracker PR (`feat/core-gateway-mvp`)
+> closes only issue #3, and Unit 3 (`ci/core-gateway-activation`) activates
+> CI, ADRs, and developer setup without re-opening that boundary.
+
 Each row is the smallest reviewable increment. All targets stay ≤ 400 lines
 unless marked with `⚠ size:exception`. The tracker PR (this one) closes
 **no** issue; it is the first child of an MVP tracker that has not been filed
