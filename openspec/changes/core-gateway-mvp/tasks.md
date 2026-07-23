@@ -48,14 +48,14 @@ Each row: RED failing test → GREEN production code → REFACTOR clean typing.
 
 ## Phase 3: Settings + Observability
 
-- [ ] 3.1 TDD row — `Settings` (Pydantic v2 `BaseSettings`): RED maps envs to host/port/version/providers_configured/otel → GREEN `src/llmux/config.py` → REFACTOR
-- [ ] 3.2 TDD row — `tracing.build_tracer`: RED no exporter when endpoint unset; SDK provider built when set → GREEN `src/llmux/observability/tracing.py` no-op default + OTLP/HTTP + batch processor (no credential/request capture) → REFACTOR
+- [x] 3.1 TDD row — `Settings` (Pydantic v2 `BaseSettings`): RED maps envs to host/port/version/providers_configured/otel → GREEN `src/llmux/config.py` → REFACTOR
+- [x] 3.2 TDD row — `tracing.build_tracer`: RED no exporter when endpoint unset; SDK provider built when set → GREEN `src/llmux/observability/tracing.py` no-op default + OTLP/HTTP + batch processor (no credential/request capture) → REFACTOR
 
 ## Phase 4: API Routes (strict TDD)
 
 - [ ] 4.1 TDD row — `GET /v1/health`: RED 200 + exact `{status, version, providers_configured}` JSON, gateway-native (not OpenAI) → GREEN `src/llmux/api/health.py` → REFACTOR
 - [ ] 4.2 TDD row — `GET /v1/models`: RED 200 + `{object:"list", data:[]}` envelope → GREEN `src/llmux/api/models.py` static list → REFACTOR
-- [ ] 4.3 TDD row — `POST /v1/chat/completions` 501 (stream=false): RED 501 + OpenAI error envelope + `application/json` (not `text/event-stream`) → GREEN `src/llmux/api/chat.py` + `ChatMessage`/`ChatCompletionRequest`/`OpenAIError`/`ErrorDetail` Pydantic models → REFACTOR
+- [ ] 4.3 TDD row — `POST /v1/chat/completions` 501 (stream=false): RED 501 + OpenAI error envelope + `application/json` (not `text/event-stream`) → GREEN `src/llmux/api/chat.py` + `ChatMessage`/`ChatCompletionRequest` Pydantic models → REFACTOR
 - [ ] 4.4 TDD row — chat 501 identical for `stream=true` and `stream`-omitted: RED all three stream cases produce identical body, content-type, no `data:` SSE → GREEN confirm single code path → REFACTOR
 
 ## Phase 5: App Factory + Test Harness
