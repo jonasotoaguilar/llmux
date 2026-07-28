@@ -70,6 +70,7 @@ def test_settings_defaults_when_no_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_settings_providers_accepts_json_and_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-parser-test")
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", '["openai","anthropic"]')
     assert Settings().llmux_providers_configured == ["openai", "anthropic"]  # type: ignore[call-arg]
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "")
