@@ -11,6 +11,7 @@ from llmux.api.chat import chat_router
 from llmux.api.health import health_router
 from llmux.api.models import models_router
 from llmux.config import Settings
+from llmux.core.providers.registry import ProviderRegistry, build_providers
 from llmux.observability.tracing import build_tracer, shutdown_tracer
 
 
@@ -18,10 +19,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings if settings is not None else Settings()  # type: ignore[call-arg]
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         build_tracer(resolved)
-        yield
-        shutdown_tracer()
+        providers: ProviderRegistry | None = None
+        try:
+            providers = build_providers(resolved)
+            app.state.providers = providers
+            yield
+        finally:
+            if providers is not None:
+                await providers.aclose()
+            shutdown_tracer()
 
     app = FastAPI(title="LLMux", version=resolved.llmux_version, lifespan=lifespan)
     app.state.settings = resolved
