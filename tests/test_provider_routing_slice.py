@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from llmux.config import Settings
@@ -25,6 +27,7 @@ from llmux.core.providers.base import (
 )
 from llmux.core.providers.openai import OpenAIAdapter
 from llmux.core.providers.registry import ProviderRegistry, build_providers
+from llmux.core.router import select_provider
 
 
 def _ok_response(content: str = "hi") -> dict[str, object]:
@@ -267,3 +270,143 @@ async def test_registry_aclose_is_idempotent(monkeypatch: pytest.MonkeyPatch) ->
     registry = build_providers(Settings())  # type: ignore[call-arg]
     await registry.aclose()
     await registry.aclose()  # must not raise
+
+
+# Router (2.1/2.2) =======================================================
+
+
+@pytest.mark.asyncio
+async def test_router_selects_first_matching_adapter() -> None:
+    """First adapter whose models() lists the model wins; later adapters ignored."""
+
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ok_response())
+
+    adapter_a, client_a = _adapter(handler, models=("gpt-4o",))
+    adapter_b, client_b = _adapter(handler, models=("gpt-4o-mini",))
+    registry = ProviderRegistry(
+        (adapter_a, adapter_b), owned_clients=(client_a, client_b)
+    )
+    try:
+        selected = await select_provider("gpt-4o", registry)
+    finally:
+        await registry.aclose()
+    assert selected is adapter_a
+
+
+@pytest.mark.asyncio
+async def test_router_raises_provider_selection_error_when_no_match() -> None:
+    """No adapter advertises the model -> ProviderSelectionError."""
+    adapter, client = _adapter(
+        lambda r: httpx.Response(200, json={}), models=("gpt-4o",)
+    )
+    registry = ProviderRegistry((adapter,), owned_clients=(client,))
+    try:
+        with pytest.raises(ProviderSelectionError) as exc:
+            await select_provider("gpt-4o-mini", registry)
+    finally:
+        await registry.aclose()
+    assert exc.value.status_code == 400
+    envelope = exc.value.to_openai_envelope()
+    inner = envelope["error"]
+    assert isinstance(inner, dict) and inner["type"] == "invalid_request_error"
+
+
+# /v1/models aggregation (2.3/2.4) ========================================
+
+
+@pytest.mark.asyncio
+async def test_models_aggregates_from_registry(app: FastAPI) -> None:
+    """GET /v1/models returns one OpenAI-shaped entry per (provider, model)."""
+    adapter, _owned = _adapter(
+        lambda r: httpx.Response(200, json={}),
+        models=("gpt-4o-mini", "gpt-4o"),
+    )
+    registry = ProviderRegistry((adapter,), owned_clients=(_owned,))
+    with TestClient(app) as c:
+        app.state.providers = registry
+        try:
+            r = c.get("/v1/models")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["object"] == "list"
+            ids = sorted(entry["id"] for entry in body["data"])
+            assert ids == ["gpt-4o", "gpt-4o-mini"]
+            for entry in body["data"]:
+                assert entry == {
+                    "id": entry["id"],
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "openai",
+                }
+        finally:
+            await registry.aclose()
+
+
+def test_models_returns_empty_list_when_registry_empty(app: FastAPI) -> None:
+    """Empty registry produces an OpenAI-shaped envelope with empty data."""
+    with TestClient(app) as c:
+        app.state.providers = ProviderRegistry(())
+        r = c.get("/v1/models")
+        assert r.status_code == 200
+        assert r.json() == {"object": "list", "data": []}
+
+
+# Lifespan (2.5/2.6) ======================================================
+
+
+def test_lifespan_attaches_providers_to_app_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_app lifespan builds the registry and attaches it to app.state."""
+    from llmux.main import create_app
+
+    _openai_env(monkeypatch)
+    app = create_app()
+    with TestClient(app) as c:
+        providers = app.state.providers
+        assert isinstance(providers, ProviderRegistry)
+        assert len(providers) == 1
+        assert c.get("/v1/models").json()["data"] != []
+
+
+def test_lifespan_closes_owned_clients_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry's owned clients are closed when the lifespan exits."""
+    from llmux.main import create_app
+
+    _openai_env(monkeypatch)
+    app = create_app()
+    with TestClient(app):
+        owned = app.state.providers._owned_clients  # noqa: SLF001
+        assert owned and not owned[0].is_closed
+    assert all(client.is_closed for client in owned)
+
+
+def test_lifespan_shuts_down_tracer_when_build_providers_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """build_providers failure during startup must still call shutdown_tracer."""
+    import llmux.main as main_mod
+    from llmux.core.errors import ConfigurationError
+    from llmux.main import create_app
+    from llmux.observability.tracing import shutdown_tracer
+
+    _openai_env(monkeypatch)
+    shutdown_calls: list[None] = []
+
+    def fake_build_providers(settings: object) -> object:
+        raise ConfigurationError("simulated failure", provider="openai")
+
+    def fake_shutdown_tracer() -> None:
+        shutdown_calls.append(None)
+        shutdown_tracer()
+
+    monkeypatch.setattr(main_mod, "build_providers", fake_build_providers)
+    monkeypatch.setattr(main_mod, "shutdown_tracer", fake_shutdown_tracer)
+
+    app = create_app()
+    with pytest.raises(ConfigurationError), TestClient(app):
+        pass
+    assert shutdown_calls

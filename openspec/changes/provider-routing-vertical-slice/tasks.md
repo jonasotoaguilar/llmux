@@ -35,13 +35,13 @@ Chain strategy: feature-branch-chain
 
 `feat/.../pr-2-router-lifespan-models` ← PR #1 → PR #1. Test: `pytest -q tests/test_provider_routing_slice.py -k "router or models"`. Harness: TestClient `/v1/models` populated/empty. Rollback: revert `main.py`, `api/models.py`; delete `core/router.py`.
 
-- [ ] 2.1 RED — `select_provider` first-match + no-match fails.
-- [ ] 2.2 GREEN `core/router.py::select_provider(model, providers)`: serial `await adapter.models()`, first match wins, `ProviderSelectionError` (400) when none.
-- [ ] 2.3 RED — `/v1/models` populated + empty-registry fails.
-- [ ] 2.4 GREEN `api/models.py::list_models` async; aggregate from `app.state.providers`; emit `{id, object:"model", created:0, owned_by}` per (provider, model).
-- [ ] 2.5 RED — lifespan builds + closes registry fails.
-- [ ] 2.6 GREEN `main.py::create_app` lifespan: `build_tracer` → `build_providers` → yield → `providers.aclose()` in `finally` → `shutdown_tracer`; attach `app.state.providers`.
-- [ ] 2.7 REFACTOR — invert `tests/test_unit_2.py::test_models_*_empty_data` to empty-registry path.
+- [x] 2.1 RED — `select_provider` first-match + no-match fails.
+- [x] 2.2 GREEN `core/router.py::select_provider(model, providers)`: serial `await adapter.models()`, first match wins, `ProviderSelectionError` (400) when none.
+- [x] 2.3 RED — `/v1/models` populated + empty-registry fails.
+- [x] 2.4 GREEN `api/models.py::list_models` async; aggregate from `app.state.providers`; emit `{id, object:"model", created:0, owned_by}` per (provider, model).
+- [x] 2.5 RED — lifespan builds + closes registry fails.
+- [x] 2.6 GREEN `main.py::create_app` lifespan: `build_tracer` → `build_providers` → yield → `providers.aclose()` in `finally` → `shutdown_tracer`; attach `app.state.providers`.
+- [x] 2.7 REFACTOR — invert `tests/test_unit_2.py::test_models_*_empty_data` to empty-registry path.
 
 ## Phase 3: Chat, Error Envelopes, Telemetry (PR #3)
 

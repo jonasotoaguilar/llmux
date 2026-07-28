@@ -144,8 +144,14 @@ def test_health_supports_empty_providers() -> None:
     assert r.json() == {"status": "ok", "version": "0.1.0", "providers_configured": []}
 
 
-def test_models_returns_openai_envelope_with_empty_data() -> None:
-    r = _client(models_router).get("/v1/models")
+def test_models_returns_empty_when_registry_is_empty() -> None:
+    """Inverted for PR2: empty registry yields an OpenAI-shaped empty list."""
+    from llmux.core.providers.registry import ProviderRegistry
+
+    app = FastAPI()
+    app.include_router(models_router, prefix="/v1")
+    app.state.providers = ProviderRegistry(())
+    r = TestClient(app).get("/v1/models")
     assert r.status_code == 200
     assert r.json() == {"object": "list", "data": []}
 
@@ -197,16 +203,19 @@ def test_create_app_resolves_settings_and_runs_lifespan(
 def test_create_app_mounts_all_three_v1_routes() -> None:
     from llmux.main import create_app
 
-    c = TestClient(create_app(settings=_s()))
-    assert c.get("/v1/health").status_code == 200
-    assert c.get("/v1/models").status_code == 200
-    assert (
-        c.post(
-            "/v1/chat/completions",
-            json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
-        ).status_code
-        == 501
-    )
+    with TestClient(create_app(settings=_s(llmux_providers_configured=[]))) as c:
+        assert c.get("/v1/health").status_code == 200
+        assert c.get("/v1/models").status_code == 200
+        assert (
+            c.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            ).status_code
+            == 501
+        )
 
 
 def test_client_fixture_from_conftest_reaches_all_v1_routes(client: TestClient) -> None:
