@@ -159,20 +159,34 @@ def test_models_returns_empty_when_registry_is_empty() -> None:
 # /v1/chat/completions ===================================================
 
 
-@pytest.mark.parametrize("s", [False, True, None], ids=["false", "true", "omitted"])
-def test_chat_501_for_all_stream_modes(s: object) -> None:
+def test_chat_501_for_stream_true_only() -> None:
+    """Inverted for PR3: only stream=true still returns 501. The stream=false
+    and stream-omitted paths now route through the provider and are covered
+    by the chat-completion tests in test_provider_routing_slice.py.
+    """
     body: dict[str, object] = {
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
     }
-    if s is not None:
-        body["stream"] = s
     r = _client(chat_router).post("/v1/chat/completions", json=body)
     assert r.status_code == 501
     assert r.headers["content-type"].startswith("application/json")
     assert "text/event-stream" not in r.headers["content-type"]
     assert "data:" not in r.text
     assert r.json() == NOT_IMPLEMENTED_ERROR
+
+
+def test_chat_request_stream_defaults_to_false() -> None:
+    """The ChatCompletionRequest pydantic model defaults stream=False when
+    omitted. Verified at the model layer so the API contract is explicit.
+    """
+    from llmux.api.chat import ChatCompletionRequest, ChatMessage
+
+    req = ChatCompletionRequest(
+        model="gpt-4", messages=[ChatMessage(role="user", content="hi")]
+    )
+    assert req.stream is False
 
 
 # App factory + conftest client fixture ==================================
@@ -206,6 +220,8 @@ def test_create_app_mounts_all_three_v1_routes() -> None:
     with TestClient(create_app(settings=_s(llmux_providers_configured=[]))) as c:
         assert c.get("/v1/health").status_code == 200
         assert c.get("/v1/models").status_code == 200
+        # Empty registry -> 400 (ProviderSelectionError), not 501. The
+        # stream=true 501 contract is covered by test_chat_501_for_stream_true_only.
         assert (
             c.post(
                 "/v1/chat/completions",
@@ -214,17 +230,19 @@ def test_create_app_mounts_all_three_v1_routes() -> None:
                     "messages": [{"role": "user", "content": "hi"}],
                 },
             ).status_code
-            == 501
+            == 400
         )
 
 
 def test_client_fixture_from_conftest_reaches_all_v1_routes(client: TestClient) -> None:
     assert client.get("/v1/health").status_code == 200
     assert client.get("/v1/models").status_code == 200
+    # Empty registry -> 400 (ProviderSelectionError), not 501. The
+    # stream=true 501 contract is covered by test_chat_501_for_stream_true_only.
     assert (
         client.post(
             "/v1/chat/completions",
             json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
         ).status_code
-        == 501
+        == 400
     )
