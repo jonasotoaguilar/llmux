@@ -47,14 +47,14 @@ Chain strategy: feature-branch-chain
 
 `feat/.../pr-3-chat-telemetry` ← PR #2 → PR #2. Test: `pytest -q tests/test_provider_routing_slice.py -k "chat or stream_501 or telemetry"`. Harness: TestClient 200/400/502/504 + `stream=true` 501 no SSE. Rollback: revert `api/chat.py`, `tests/test_unit_2.py`; delete `observability/metrics.py`.
 
-- [ ] 3.1 RED — `stream=false` 200 success fails.
-- [ ] 3.2 GREEN `api/chat.py::post_chat_completion` async: `stream=true`→501; else select+call+reconstruct OpenAI envelope; OTel span `chat.completion`.
-- [ ] 3.3 RED — upstream 502 + timeout 504 fails.
-- [ ] 3.4 GREEN — map `ProviderSelectionError`→400, `UpstreamError`→502, `UpstreamTimeoutError`→504, `ConfigurationError`→502.
-- [ ] 3.5 RED — `stream=true` 501-no-SSE + omitted-`stream` defaults-false fails.
-- [ ] 3.6 GREEN — invert `tests/test_unit_2.py::test_chat_501_for_all_stream_modes` to `stream=true`-only; add omitted-`stream` test.
-- [ ] 3.7 RED — span + 3-metrics fails (no instruments).
-- [ ] 3.8 GREEN `observability/metrics.py`: counters+histogram per spec via `opentelemetry-api`; record every hop.
-- [ ] 3.9 REFACTOR — extract OpenAI envelope builder; verify zero `data:` frames, zero `text/event-stream`.
+- [x] 3.1 RED — `stream=false` 200 success fails.
+- [x] 3.2 GREEN `api/chat.py::post_chat_completion` async: `stream=true`→501; else select+call+reconstruct OpenAI envelope; OTel span `chat.completion`.
+- [x] 3.3 RED — upstream 502 + timeout 504 fails.
+- [x] 3.4 GREEN — map `ProviderSelectionError`→400, `UpstreamError`→502, `UpstreamTimeoutError`→504, `ConfigurationError`→502.
+- [x] 3.5 RED — `stream=true` 501-no-SSE + omitted-`stream` defaults-false fails.
+- [x] 3.6 GREEN — invert `tests/test_unit_2.py::test_chat_501_for_all_stream_modes` to `stream=true`-only; add omitted-`stream` test.
+- [x] 3.7 RED — span + 3-metrics fails (no instruments).
+- [x] 3.8 GREEN `observability/metrics.py`: counters+histogram per spec via `opentelemetry-api`; record every hop.
+- [x] 3.9 REFACTOR — extract OpenAI envelope builder; verify zero `data:` frames, zero `text/event-stream`.
 
 Tracker draft/no-merge; rollback 3 → 2 → 1.

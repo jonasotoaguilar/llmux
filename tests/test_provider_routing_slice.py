@@ -1,4 +1,4 @@
-"""Provider Routing Vertical Slice — PR1 tests (RED/GREEN, behavior-first)."""
+"""Provider Routing Vertical Slice — PR1+PR2+PR3 tests (RED/GREEN, behavior-first)."""
 
 from __future__ import annotations
 
@@ -410,3 +410,291 @@ def test_lifespan_shuts_down_tracer_when_build_providers_fails(
     with pytest.raises(ConfigurationError), TestClient(app):
         pass
     assert shutdown_calls
+
+
+# Phase 3: Chat completion, error envelopes, telemetry (3.1–3.8) ==========
+_BODY = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+
+
+def _ok_handler(_r: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json=_ok_response("hello"))
+
+
+def _err_handler(_r: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, json={"error": "boom"})
+
+
+def _timeout_handler(r: httpx.Request) -> httpx.Response:
+    raise httpx.TimeoutException("simulated", request=r)
+
+
+def _build_chat_app(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("gpt-4o-mini",),
+) -> tuple[FastAPI, ProviderRegistry, httpx.AsyncClient]:
+    """Build a FastAPI app with a mocked OpenAI adapter for chat tests."""
+    from llmux.api.chat import chat_router
+
+    adapter, client = _adapter(handler, models=models)
+    registry = ProviderRegistry((adapter,), owned_clients=(client,))
+    app = FastAPI()
+    app.include_router(chat_router, prefix="/v1")
+    app.state.providers = registry
+    return app, registry, client
+
+
+def _aclose_sync(client: httpx.AsyncClient) -> None:
+    import asyncio
+
+    asyncio.run(client.aclose())
+
+
+def test_chat_completion_stream_false_returns_200_envelope() -> None:
+    app, _registry, client = _build_chat_app(_ok_handler)
+    try:
+        with TestClient(app) as c:
+            r = c.post("/v1/chat/completions", json={**_BODY, "stream": False})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["object"] == "chat.completion"
+        assert body["model"] == "gpt-4o-mini"
+        assert body["choices"][0]["message"] == {
+            "role": "assistant",
+            "content": "hello",
+        }
+        assert body["choices"][0]["finish_reason"] == "stop"
+        assert body["usage"]["prompt_tokens"] == 5
+        assert body["usage"]["completion_tokens"] == 1
+        assert "data:" not in r.text
+        assert "text/event-stream" not in r.headers["content-type"]
+    finally:
+        _aclose_sync(client)
+
+
+# 3.3 / 3.4 — upstream 502 + timeout 504 (no-match 400 covered by test_unit_2.py)
+@pytest.mark.parametrize(
+    "handler,status,error_type",
+    [
+        (_err_handler, 502, "upstream_error"),
+        (_timeout_handler, 504, "upstream_timeout_error"),
+    ],
+)
+def test_chat_completion_error_envelopes(
+    handler: Callable[[httpx.Request], httpx.Response],
+    status: int,
+    error_type: str,
+) -> None:
+    app, _registry, client = _build_chat_app(handler)
+    try:
+        with TestClient(app) as c:
+            r = c.post("/v1/chat/completions", json=_BODY)
+        assert r.status_code == status
+        body = r.json()
+        assert body["error"]["type"] == error_type
+        assert body["error"]["param"] is None
+        assert body["error"]["code"] == error_type
+        # No-SSE invariant: error envelopes are JSON, never chunked/SSE.
+        assert r.headers["content-type"].startswith("application/json")
+        assert "text/event-stream" not in r.headers["content-type"]
+        assert "data:" not in r.text
+    finally:
+        _aclose_sync(client)
+
+
+# 3.5 — omitted stream defaults to false (success path)
+def test_chat_completion_omitted_stream_routes_to_provider() -> None:
+    app, _registry, client = _build_chat_app(_ok_handler)
+    try:
+        with TestClient(app) as c:
+            r = c.post("/v1/chat/completions", json=_BODY)  # no stream key
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"] == "hello"
+    finally:
+        _aclose_sync(client)
+
+
+# 3.7 / 3.8 — span + 3 metrics
+def test_chat_completion_emits_span_and_three_metrics() -> None:
+    from opentelemetry import metrics as otel_metrics
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic import SecretStr
+
+    from llmux.core.providers.openai import OpenAIAdapter
+
+    # Install in-memory OTel providers for this test only.
+    metric_reader = InMemoryMetricReader()
+    otel_metrics._internal._METER_PROVIDER_SET_ONCE._done = False
+    otel_metrics._internal._METER_PROVIDER = None
+    otel_metrics.set_meter_provider(MeterProvider(metric_readers=[metric_reader]))
+    span_exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+    otel_trace._TRACER_PROVIDER = None
+    otel_trace.set_tracer_provider(tracer_provider)
+    try:
+        # Two adapters in one app: success hop populates requests + duration,
+        # then we swap to the err adapter so the second hop populates errors.
+        app, registry, ok_client = _build_chat_app(_ok_handler)
+        err_client = httpx.AsyncClient(transport=httpx.MockTransport(_err_handler))
+        err_adapter = OpenAIAdapter(
+            client=err_client,
+            api_key=SecretStr("test-key"),
+            base_url="https://api.openai.com/v1",
+            models=("gpt-4o-mini",),
+            timeout_s=10.0,
+        )
+        try:
+            with TestClient(app) as c:
+                r_ok = c.post("/v1/chat/completions", json=_BODY)
+                registry._adapters = (err_adapter,)
+                registry._owned_clients = tuple(
+                    list(registry._owned_clients) + [err_client]
+                )
+                r_err = c.post("/v1/chat/completions", json=_BODY)
+            assert r_ok.status_code == 200
+            assert r_err.status_code == 502
+        finally:
+            _aclose_sync(ok_client)
+
+        chat_spans = [
+            s for s in span_exporter.get_finished_spans() if s.name == "chat.completion"
+        ]
+        success_span = next(
+            s
+            for s in chat_spans
+            if s.attributes and s.attributes.get("error.type") is None
+        )
+        attrs = dict(success_span.attributes or {})
+        want = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": "gpt-4o-mini",
+            "gen_ai.provider.name": "openai",
+            "gen_ai.response.model": "gpt-4o-mini",
+            "gen_ai.usage.input_tokens": 5,
+            "gen_ai.usage.output_tokens": 1,
+        }
+        for key, value in want.items():
+            assert attrs.get(key) == value, key
+        assert "llmux.request.duration_ms" in attrs
+
+        data = metric_reader.get_metrics_data()
+        assert data is not None
+        names = {
+            m.name
+            for rm in data.resource_metrics
+            for sm in rm.scope_metrics
+            for m in sm.metrics
+        }
+        assert names >= {
+            "chat_completion_requests_total",
+            "chat_completion_errors_total",
+            "chat_completion_duration_seconds",
+        }
+    finally:
+        otel_metrics._internal._METER_PROVIDER_SET_ONCE._done = False
+        otel_metrics._internal._METER_PROVIDER = None
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
+        _aclose_sync(err_client)
+
+
+# === Correction regressions: review-ba75bd08037a5aff =====================
+def test_record_chat_completion_uses_stable_keys_and_marks_uncaught_exception_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from llmux.observability import metrics as metrics_mod
+
+    mock = MagicMock(wraps=metrics_mod._request_counter.add)
+    monkeypatch.setattr(metrics_mod._request_counter, "add", mock)
+    metrics_mod.record_chat_completion(
+        provider="openai",
+        model="gpt-4o-mini",
+        outcome="success",
+        error_type=None,
+        duration_seconds=0.1,
+    )
+    metrics_mod.record_chat_completion(
+        provider="openai",
+        model="gpt-4o-mini",
+        outcome="error",
+        error_type="upstream_error",
+        duration_seconds=0.2,
+    )
+    with (
+        pytest.raises(RuntimeError),
+        metrics_mod.ChatCompletionTimer(provider="openai", model="gpt-4o-mini"),
+    ):
+        raise RuntimeError("boom")
+    attrs = [c.args[1] for c in mock.call_args_list]
+    assert {frozenset(a) for a in attrs} == {
+        frozenset({"provider", "model", "outcome", "error_type"})
+    }
+    assert (
+        attrs[0]["error_type"] == "none" and attrs[1]["error_type"] == "upstream_error"
+    )
+    assert attrs[2]["outcome"] == metrics_mod.OUTCOME_ERROR
+    assert attrs[2]["error_type"] == metrics_mod.ERROR_TYPE_INTERNAL
+
+
+def test_chat_completion_no_match_sets_error_status_and_bounded_sentinel() -> None:
+    from opentelemetry import metrics as om
+    from opentelemetry import trace as ot
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    mr = InMemoryMetricReader()
+    om._internal._METER_PROVIDER_SET_ONCE._done = False
+    om._internal._METER_PROVIDER = None
+    om.set_meter_provider(MeterProvider(metric_readers=[mr]))
+    se = InMemorySpanExporter()
+    tp = TracerProvider()
+    tp.add_span_processor(SimpleSpanProcessor(se))
+    ot._TRACER_PROVIDER_SET_ONCE._done = False
+    ot._TRACER_PROVIDER = None
+    ot.set_tracer_provider(tp)
+    try:
+        app, _r, client = _build_chat_app(_ok_handler, models=("gpt-4o-mini",))
+        try:
+            with TestClient(app) as c:
+                r1 = c.post("/v1/chat/completions", json={**_BODY, "model": "evil-A"})
+                r2 = c.post("/v1/chat/completions", json={**_BODY, "model": "evil-B"})
+            assert r1.status_code == r2.status_code == 400
+        finally:
+            _aclose_sync(client)
+        err = [
+            s
+            for s in se.get_finished_spans()
+            if s.name == "chat.completion" and s.status.status_code.name == "ERROR"
+        ]
+        assert err, "expected ERROR-status chat.completion spans"
+        seen = {
+            str(attrs["model"])
+            for rm in mr.get_metrics_data().resource_metrics  # type: ignore[union-attr]
+            for sm in rm.scope_metrics
+            for m in sm.metrics
+            for pt in m.data.data_points
+            for attrs in [pt.attributes or {}]
+            if "model" in attrs
+        }
+        assert seen == {"unknown"}, seen
+    finally:
+        om._internal._METER_PROVIDER_SET_ONCE._done = False
+        om._internal._METER_PROVIDER = None
+        ot._TRACER_PROVIDER_SET_ONCE._done = False
+        ot._TRACER_PROVIDER = None
