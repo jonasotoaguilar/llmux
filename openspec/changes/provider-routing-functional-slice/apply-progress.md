@@ -96,5 +96,35 @@
 - **Import harness**: `uv run python -c "from llmux.core.providers.registry import ProviderRegistry, RegistryEntry, build_providers, ClientFactory; ..."` + signature assertions → `IMPORT HARNESS OK`.
 - **Runtime cleanup harness**: real `Settings(LLMUX_PROVIDERS_CONFIGURED='openai', OPENAI_API_KEY='sk-harness', OPENAI_MODELS='gpt-4o-mini')` → `await build_providers(s)` (default factory creates real `httpx.AsyncClient`) → assert `not is_closed` → `aclose()` → assert `is_closed` → 2× more `aclose()` (idempotent) → `RUNTIME CLEANUP HARNESS OK`.
 - **No double-close**: `_CountingClient.aclose_count == 1` asserted on every test that exercises cleanup OR aclose (cleanup path AND registry path); mixed-ownership test asserts `mock_client.is_closed is False` after aclose — caller-owned clients are never re-closed.
-- **Deterministic factory seam**: `test_build_providers_closes_first_client_on_later_failure` — `["openai","anthropic"]` + `_counting_factory` → 1 factory call, 2nd slug unknown, 1st client `is_closed and aclose_count == 1`, no registry returned.
-- **Rollback**: drop `registry.py`; revert test additions; revert `tasks.md` and this section. PR1+PR2 baseline untouched; no router, no lifespan, no endpoint, no telemetry, no new env var or dep.
+  - **Deterministic factory seam**: `test_build_providers_closes_first_client_on_later_failure` — `["openai","anthropic"]` + `_counting_factory` → 1 factory call, 2nd slug unknown, 1st client `is_closed and aclose_count == 1`, no registry returned.
+  - **Rollback**: drop `registry.py`; revert test additions; revert `tasks.md` and this section. PR1+PR2 baseline untouched; no router, no lifespan, no endpoint, no telemetry, no new env var or dep.
+
+---
+
+# PR4 — Router + Lifespan + /v1/models (base PR3) ✅
+
+**Branch**: `feat/provider-routing-functional-slice-04-router-lifespan-models` (base = PR3 merge `ec08419`, child of tracker). **Scope**: async first-match `select_provider`; fail-safe FastAPI lifespan (build_tracer → build_providers inside try, registry `aclose()` BEFORE tracer shutdown, tracer always shuts down even on build failure, no double-close); `/v1/models` aggregates one OpenAI entry per `(provider, model)` from `app.state.providers`, empty when no providers. No chat routing, no telemetry, no `/v1/chat/completions` change.
+
+- [x] 4.1 RED: `router_first_match_returns_priority_provider`, `router_no_match_raises_provider_selection_error`
+- [x] 4.2 GREEN: create `core/router.py` (async first-match `select_provider`, no fallback)
+- [x] 4.3 RED: `lifespan_tracer_shutdown_on_build_failure`, `lifespan_aclose_before_tracer_shutdown`
+- [x] 4.4 GREEN: modify `main.py` lifespan (try/finally; aclose before shutdown_tracer; tracer always shutdown)
+- [x] 4.5 RED: `models_aggregates_one_per_provider_model`, `models_empty_when_no_providers`
+- [x] 4.6 GREEN: modify `api/models.py` to source from `app.state.providers`
+
+**Files (this PR)**:
+- `src/llmux/core/router.py` (created, 38 LoC): `async def select_provider(model, registry)` walks `registry.providers` in order, returns the first adapter whose `await adapter.models()` contains the requested id; raises `ProviderSelectionError` (HTTP 400) on no match. The error body uses the class-level `safe_message` (no raw model id leak) per the existing envelope contract.
+- `src/llmux/main.py` (modified): lifespan now `build_tracer` first, then `await build_providers` inside a `try: ... finally:` so `aclose` (only when a registry was returned) runs BEFORE `shutdown_tracer`. When `build_providers` raises, no `aclose` is attempted (the factory's `except BaseException` already cleaned up partial clients — PR3 invariant), but `shutdown_tracer` always runs. `app.state.providers` is set right before `yield` for handler access.
+- `src/llmux/api/models.py` (modified): async handler sources `app.state.providers`; `getattr(..., None)` for the no-lifespan test-harness case returns `{"object":"list","data":[]}`; otherwise `await registry.models()` and shape each `ModelInfo` as `{id, object:"model", created:0, owned_by:provider}`.
+- `tests/test_provider_routing_slice.py` (extended, +204 LoC, 6 new tests + helpers): `_make_static_adapter` (Protocol-shaped, caller-owned MockTransport); `_Recorder`; `_patch_lifespan` (patches `build_tracer`/`shutdown_tracer` in BOTH `observability.tracing` and `main` because `create_app` imports the names into its local scope).
+
+**Work Unit Evidence**:
+- **Focused**: `uv run pytest tests/test_provider_routing_slice.py -k "router or lifespan or models_" -v` → `6 passed`.
+- **Full + coverage**: `uv run pytest -q --cov=llmux --cov-fail-under=90` → `69 passed`; total `98.45%` (gate ≥ 90% reached). `router.py` = 100% (10/10 stmts), `main.py` = 100% (30/30 stmts), `api/models.py` = 100% (13/13 stmts).
+- **Ruff + Mypy**: `uv run ruff format src tests && uv run ruff check src tests` → `All checks passed!`; `uv run mypy src tests` → `Success: no issues found in 19 source files` (strict).
+- **Import + shape harness**: `python -c "..."` with `inspect.iscoroutinefunction` checks for `select_provider`/`build_providers`/`list_models`/`aclose`/`models`; `inspect.getsource(create_app)` confirms `await registry.aclose()` appears before `shutdown_tracer()`; `inspect.signature(select_provider)` is `(model, registry)`. → `IMPORT + SHAPE HARNESS OK`.
+- **Live ASGI runtime harness**: real `httpx.AsyncClient` (production-shaped) registered through the real `ProviderRegistry`; `app.state.providers` populated by the lifespan; `GET /v1/models` via `TestClient` returns `{"object":"list","data":[{"id":"gpt-4o-mini","object":"model","created":0,"owned_by":"openai"}, {"id":"gpt-4o",...}]}`; after `__exit__` the real client `is_closed` is `True` (proves `aclose` ran); the real client is never double-closed. → `LIVE ASGI HARNESS OK`.
+- **Startup-failure harness**: patched `build_providers` to raise `ConfigurationError`; `events == ["build_tracer", "build_providers", "shutdown_tracer"]` (no `"aclose"`); tracer still shuts down. → `STARTUP-FAILURE HARNESS OK`.
+- **No double-close**: factory-owned clients are created and owned exactly once (`aclose` recorded exactly once on the recording registry in the success path; factory's `BaseException` cleanup owns partial clients in the failure path so the lifespan never re-closes them).
+- **PR4 native lines** (this branch vs. parent): `tasks.md` 12, `api/models.py` 41, `main.py` 38, `tests/test_provider_routing_slice.py` 204 added, `core/router.py` 38 new = **333** total (under 400).
+- **Rollback**: drop `core/router.py`; revert `main.py` and `api/models.py`; revert the PR4 test additions; revert `tasks.md` and this section. PR3 baseline (config + errors + OpenAI adapter + registry) is fully preserved — the `aclose`-before-`shutdown_tracer` order is reintroduced alongside this PR's changes and is the only order that satisfies the PR3 ownership contract.

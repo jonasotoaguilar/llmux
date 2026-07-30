@@ -43,12 +43,12 @@ Chain strategy: feature-branch-chain
 
 ## PR4 — Router + Lifespan + /v1/models (base PR3)
 
-- [ ] 4.1 RED: `router_first_match`, `router_no_match_raises_provider_selection_error`
-- [ ] 4.2 GREEN: create `core/router.py` (async first-match `select_provider`)
-- [ ] 4.3 RED: `lifespan_tracer_shutdown_on_build_failure`, `aclose_before_tracer_shutdown`
-- [ ] 4.4 GREEN: modify `main.py` lifespan (try/finally; `aclose` then `shutdown_tracer`)
-- [ ] 4.5 RED: `models_aggregates_one_per_{provider_model,empty_when_no_providers}`
-- [ ] 4.6 GREEN: modify `api/models.py` to source from `app.state.providers`
+- [x] 4.1 RED: `router_first_match`, `router_no_match_raises_provider_selection_error`
+- [x] 4.2 GREEN: create `core/router.py` (async first-match `select_provider`)
+- [x] 4.3 RED: `lifespan_tracer_shutdown_on_build_failure`, `aclose_before_tracer_shutdown`
+- [x] 4.4 GREEN: modify `main.py` lifespan (try/finally; `aclose` then `shutdown_tracer`)
+- [x] 4.5 RED: `models_aggregates_one_per_{provider_model,empty_when_no_providers}`
+- [x] 4.6 GREEN: modify `api/models.py` to source from `app.state.providers`
 
 ## PR5 — Chat Routing + Envelopes, no telemetry (base PR4)
 

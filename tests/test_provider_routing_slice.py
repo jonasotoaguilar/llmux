@@ -1,4 +1,8 @@
-"""Provider routing functional slice: PR1+PR2+PR3 (config, errors, OpenAI, registry)."""
+"""Provider routing functional slice: PR1+PR2+PR3+PR4 tests.
+
+Covers config, errors, OpenAI adapter, registry, async router, lifespan
+wiring, and the /v1/models endpoint.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,9 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from pydantic import SecretStr
+from starlette.testclient import TestClient
 
 from llmux.config import Settings
 from llmux.core.errors import (
@@ -32,6 +38,9 @@ from llmux.core.providers.registry import (
     RegistryEntry,
     build_providers,
 )
+from llmux.core.router import select_provider
+from llmux.main import create_app
+from llmux.observability import tracing as tracing_mod
 
 _OPENAI_ENV = (
     "LLMUX_PROVIDERS_CONFIGURED",
@@ -606,3 +615,196 @@ async def test_build_providers_default_factory_creates_and_closes_real_client(
     assert real_client.is_closed
     await registry.aclose()
     await registry.aclose()
+
+
+# ----- 4.1 / 4.2 — Async first-match select_provider ------------------------
+
+
+def _make_static_adapter(
+    name: str, model_ids: tuple[str, ...]
+) -> tuple[ProviderAdapter, httpx.AsyncClient]:
+    """OpenAIAdapter-shaped (Protocol) with caller-owned MockTransport client."""
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"data": []}))
+    )
+    adapter = OpenAIAdapter(
+        client=client,
+        api_key=SecretStr("sk-test"),
+        base_url="https://api.openai.com/v1",
+        models=model_ids,
+        timeout_s=10.0,
+    )
+    adapter.name = name
+    return adapter, client
+
+
+@pytest.mark.asyncio
+async def test_router_first_match_returns_priority_provider() -> None:
+    """First provider in configured order wins for an offered model; no
+    fallback to later providers (spec: first-match, no fallback)."""
+    a, ac = _make_static_adapter("a", ("shared", "a-only"))
+    b, bc = _make_static_adapter("b", ("shared",))
+    try:
+        registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
+        assert await select_provider("shared", registry) is a
+        assert await select_provider("a-only", registry) is a
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_router_no_match_raises_provider_selection_error() -> None:
+    """When no provider offers the model, select_provider raises
+    ProviderSelectionError (envelope → HTTP 400 ``model_not_found``)."""
+    a, ac = _make_static_adapter("a", ("m1",))
+    b, bc = _make_static_adapter("b", ("m2",))
+    try:
+        registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
+        with pytest.raises(ProviderSelectionError):
+            await select_provider("missing", registry)
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+# ----- 4.3 / 4.4 — Fail-safe lifespan (tracer shutdown on build failure) ----
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+
+def _patch_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: _Recorder,
+    *,
+    raise_on_build: BaseException | None = None,
+    registry_to_return: object = None,
+) -> None:
+    """Patch build_tracer/shutdown_tracer/build_providers in main + tracing."""
+    import llmux.main as main_mod
+
+    def fake_build_tracer(_settings: object) -> object:
+        recorder.events.append("build_tracer")
+        return object()
+
+    def fake_shutdown_tracer() -> None:
+        recorder.events.append("shutdown_tracer")
+
+    monkeypatch.setattr(tracing_mod, "build_tracer", fake_build_tracer)
+    monkeypatch.setattr(main_mod, "build_tracer", fake_build_tracer)
+    monkeypatch.setattr(main_mod, "shutdown_tracer", fake_shutdown_tracer)
+
+    async def fake_build_providers(_settings: object) -> object:
+        recorder.events.append("build_providers")
+        if raise_on_build is not None:
+            raise raise_on_build
+        return registry_to_return
+
+    monkeypatch.setattr(main_mod, "build_providers", fake_build_providers)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_tracer_shutdown_on_build_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When build_providers raises ConfigurationError, shutdown_tracer MUST
+    still run; the tracer is unconditionally shut down (guardrail from PR3
+    pre-discovery)."""
+    recorder = _Recorder()
+    _patch_lifespan(monkeypatch, recorder, raise_on_build=ConfigurationError("boom"))
+    app = create_app(settings=Settings())  # type: ignore[call-arg]
+    with pytest.raises(ConfigurationError):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover
+    assert recorder.events == ["build_tracer", "build_providers", "shutdown_tracer"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_aclose_before_tracer_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On successful build, registry aclose() MUST run BEFORE shutdown_tracer;
+    aclose runs exactly once (no double-close of factory-owned clients)."""
+    recorder = _Recorder()
+
+    class _RecordingRegistry:
+        def __init__(self) -> None:
+            self.aclose_count = 0
+
+        async def aclose(self) -> None:
+            self.aclose_count += 1
+            recorder.events.append("aclose")
+
+        async def models(self) -> tuple[object, ...]:
+            return ()
+
+    built = _RecordingRegistry()
+    _patch_lifespan(monkeypatch, recorder, registry_to_return=built)
+    app = create_app(settings=Settings())  # type: ignore[call-arg]
+    async with app.router.lifespan_context(app):
+        assert app.state.providers is built
+    assert built.aclose_count == 1
+    assert recorder.events == [
+        "build_tracer",
+        "build_providers",
+        "aclose",
+        "shutdown_tracer",
+    ]
+
+
+# ----- 4.5 / 4.6 — /v1/models aggregation from app.state.providers ----------
+
+
+@pytest.mark.asyncio
+async def test_models_aggregates_one_per_provider_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/models returns one OpenAI-shaped entry per (provider, model)
+    pair sourced from app.state.providers, ordered by provider then model."""
+    a, ac = _make_static_adapter("a", ("m1", "m2"))
+    b, bc = _make_static_adapter("b", ("m3",))
+    try:
+        registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
+        _patch_lifespan(monkeypatch, _Recorder(), registry_to_return=registry)
+        app = create_app(
+            settings=Settings.model_construct(
+                llmux_host="127.0.0.1",
+                llmux_port=8000,
+                llmux_version="0.1.0",
+                llmux_providers_configured=[],
+                otel_service_name="llmux-test",
+                otel_exporter_otlp_endpoint="",
+            )
+        )
+        with TestClient(app) as client:
+            response = client.get("/v1/models")
+        body = response.json()
+        assert response.status_code == 200
+        assert body["object"] == "list"
+        ids = [e["id"] for e in body["data"]]
+        assert ids == ["m1", "m2", "m3"]
+        owned_by = [e["owned_by"] for e in body["data"]]
+        assert owned_by == ["a", "a", "b"]
+        for e in body["data"]:
+            assert e["object"] == "model"
+            assert e["created"] == 0
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_models_empty_when_no_providers() -> None:
+    """With no app.state.providers (no lifespan), GET /v1/models returns 200
+    with an empty data array; the endpoint MUST NOT crash on missing state."""
+    from llmux.api.models import models_router
+
+    bare_app = FastAPI()
+    bare_app.include_router(models_router, prefix="/v1")
+    with TestClient(bare_app) as client:
+        response = client.get("/v1/models")
+    assert response.status_code == 200
+    assert response.json() == {"object": "list", "data": []}
