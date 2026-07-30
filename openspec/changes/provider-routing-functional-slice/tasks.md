@@ -20,12 +20,14 @@ Chain strategy: feature-branch-chain
 | 5 | `pytest -k "chat_routing or chat_envelope" -q` | 200/400/502/504; `stream=true` → 501 JSON · revert `api/chat.py` to 501 stub |
 | 6 | `pytest -k "telemetry or chat_telemetry" -q` | exporter: span ERROR, sentinel, error counter · rm `observability/metrics.py`; revert `api/chat.py` to PR5 |
 
-## PR1 — Config + Errors (base tracker)
+## PR1 — Config + Errors (base tracker) ✅
 
-- [ ] 1.1 RED: `openai_settings_{valid,empty_key_raises,empty_models_raises,invalid_url_raises}`
-- [ ] 1.2 GREEN: extend `config.py` (key/base_url/models/timeout_s); update `.env.example`
-- [ ] 1.3 RED: `errors_envelope_{selection_400,config_502,upstream_502,timeout_504,sanitized}`
-- [ ] 1.4 GREEN: create `core/errors.py` (`LLMuxError`+4 subclasses+`to_openai_envelope`)
+> **Scope (this batch, 2026-07-30)** — narrowed by orchestrator to **config + normalized errors only**; adapter, registry, router, endpoints, and telemetry land in PR2–PR6 to keep this PR ≤400 authored lines.
+
+- [x] 1.1 RED: `openai_settings_{valid,empty_key_raises,empty_models_raises,invalid_url_raises}`
+- [x] 1.2 GREEN: extend `config.py` (key/base_url/models/timeout_s); update `.env.example`
+- [x] 1.3 RED: `errors_envelope_{selection_400,config_502,upstream_502,timeout_504,sanitized}`
+- [x] 1.4 GREEN: create `core/errors.py` (`LLMuxError`+4 subclasses+`to_openai_envelope`)
 
 ## PR2 — OpenAI Adapter (base PR1)
 
