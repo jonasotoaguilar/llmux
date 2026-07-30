@@ -70,7 +70,12 @@ def test_settings_defaults_when_no_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_settings_providers_accepts_json_and_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # OPENAI_API_KEY + OPENAI_MODELS are required when 'openai' is in
+    # LLMUX_PROVIDERS_CONFIGURED; the fail-fast ConfigurationError is
+    # exercised separately in test_provider_routing_slice.
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", '["openai","anthropic"]')
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-123")
+    monkeypatch.setenv("OPENAI_MODELS", "gpt-4o-mini")
     assert Settings().llmux_providers_configured == ["openai", "anthropic"]  # type: ignore[call-arg]
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "")
     assert Settings().llmux_providers_configured == []  # type: ignore[call-arg]
