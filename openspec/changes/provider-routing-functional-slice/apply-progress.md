@@ -46,8 +46,30 @@
 
 ## Remaining Tasks (next PRs)
 
-- [ ] 2.1–2.3 — OpenAI non-streaming adapter (`core/providers/openai.py`).
 - [ ] 3.1–3.3 — `ProviderRegistry` + `build_providers` with the fail-fast / `aclose` ownership contract.
 - [ ] 4.1–4.6 — Async first-match `select_provider`, fail-safe lifespan, `/v1/models` aggregation.
 - [ ] 5.1–5.5 — Chat routing + envelopes (no telemetry).
 - [ ] 6.1–6.6 — OTel span, three bounded metrics, `MODEL_UNKNOWN` sentinel, uncaught-exception accounting.
+
+---
+
+# PR2 — OpenAI Adapter (base PR1) ✅
+
+**Branch**: `feat/provider-routing-functional-slice-02-openai` (base = PR1 merge `23d299c`). **Scope**: OpenAI non-streaming `ProviderAdapter` only — no registry, no router, no lifespan, no endpoints, no telemetry.
+
+- [x] 2.1 RED: `complete_returns_result`, `complete_stream_raises_not_implemented`
+- [x] 2.2 RED: `upstream_4xx_5xx→upstream_error`, `timeout→upstream_timeout`
+- [x] 2.3 GREEN: create `core/providers/openai.py` (Protocol, injected `httpx.AsyncClient`)
+
+**Files (this PR)**:
+- `src/llmux/core/providers/openai.py` (created): `OpenAIAdapter` (kw-only ctor); `complete` POSTs `/chat/completions` (Bearer, `stream:false`, options merged, `timeout=`); `complete_stream` raises `NotImplementedError`; `models` per id; `health` probes `GET /models`; `_parse_completion` → `CompletionResult`, sanitized `UpstreamError` on any malformed shape.
+- `tests/test_provider_routing_slice.py` (extended): +8 behavior-first tests via `httpx.MockTransport` and caller-owned client (`aclose` in test only): protocol; success; request shape; `NotImplementedError`; 8-case parametrized failure map; `models`; 3-case parametrized `health`.
+- `tasks.md` + `apply-progress.md` (modified): PR2 marked `[x]`; this evidence appended.
+
+**Work Unit Evidence**:
+- **Focused**: `uv run pytest tests/test_provider_routing_slice.py -q` → `28 passed` (`25 passed, 7 deselected` under `-k openai`).
+- **Full + coverage**: `uv run pytest -q --cov=llmux --cov-fail-under=90` → `58 passed`; total `98.33%`; `openai.py` = `98%` (56/57 stmts — line 117 is the defensive non-dict guard).
+- **Ruff + Mypy**: `uv run ruff format … && uv run ruff check …` → `All checks passed!`; `uv run mypy src tests` → `Success: no issues found in 17 source files`.
+- **Import**: `python -c "from llmux.core.providers.openai import OpenAIAdapter; from llmux.core.providers.base import ProviderAdapter, CompletionResult, HealthStatus, ModelInfo; assert isinstance(OpenAIAdapter.__new__(OpenAIAdapter), ProviderAdapter)"` → `OK`.
+- **Live MockTransport harness**: real `httpx.AsyncClient(transport=httpx.MockTransport(handler))`, three async calls (`complete`+`models`+`health`) on one caller-owned client inside `async with`, 0 network bytes, 0 client leaks → `LIVE HARNESS OK`.
+- **Rollback / no test-client double-close**: drop `openai.py`; revert the test additions. PR1 baseline untouched; no new dep, no env var, no FastAPI route. Every PR2 test calls `await client.aclose()` exactly once in `finally`; the adapter never closes the injected client — verified by the live harness and by the Protocol (no `aclose` exposed).
