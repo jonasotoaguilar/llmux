@@ -774,6 +774,98 @@ async def test_lifespan_aclose_before_tracer_shutdown(
     ]
 
 
+@pytest.mark.asyncio
+async def test_lifespan_owned_client_stays_open_while_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behavior-first regression: a registry-owned ``httpx.AsyncClient``
+    MUST stay open while serving a routed request and close exactly
+    once after TestClient shutdown.
+
+    The previous lifespan closed the registry inside a ``finally`` that
+    ran BEFORE ``yield``, so the live ASGI harness observed the owned
+    client already closed and a routed POST returned 500. The unit
+    tests did not catch it because they used a ``_RecordingRegistry``
+    stub whose fake ``aclose`` was a no-op on a real client.
+
+    This test wires a real ``httpx.AsyncClient(transport=MockTransport)``
+    through a real ``ProviderRegistry((RegistryEntry(adapter, client),))``
+    (registry-owned, NOT caller-owned) and proves:
+      1. the real client is open inside the lifespan,
+      2. a POST ``/v1/chat/completions`` returns 200 and the
+         MockTransport handler actually served the request,
+      3. the real client is still open after the request,
+      4. after TestClient exit the real client is closed exactly once,
+      5. the event sequence is still
+         ``[build_tracer, build_providers, aclose, shutdown_tracer]``.
+    """
+    from llmux.main import create_app as _create_app
+
+    handler_calls: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        handler_calls.append(request)
+        return httpx.Response(200, json=_ok_payload("live"))
+
+    real_owned_client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    real_adapter = OpenAIAdapter(
+        client=real_owned_client,
+        api_key=SecretStr("sk-regression-owned-client"),
+        base_url="https://api.openai.com/v1",
+        models=("gpt-4o-mini",),
+        timeout_s=10.0,
+    )
+    real_registry = ProviderRegistry(
+        (RegistryEntry(real_adapter, client=real_owned_client),)
+    )
+
+    recorder = _Recorder()
+    _patch_lifespan(monkeypatch, recorder, registry_to_return=real_registry)
+    app = _create_app(
+        settings=Settings.model_construct(
+            llmux_host="127.0.0.1",
+            llmux_port=8000,
+            llmux_version="0.1.0",
+            llmux_providers_configured=["openai"],
+            otel_service_name="llmux-test",
+            otel_exporter_otlp_endpoint="",
+        )
+    )
+
+    with TestClient(app) as tc:
+        # (1) inside the lifespan, the real owned client is open.
+        assert app.state.providers is real_registry
+        assert not real_owned_client.is_closed
+        # (2) routed POST succeeds; the MockTransport served it.
+        response = tc.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["choices"][0]["message"]["content"] == "live"
+        assert len(handler_calls) == 1
+        # (3) still open during the lifespan (the bug closed it pre-yield).
+        assert not real_owned_client.is_closed
+
+    # (4) after TestClient exit: real owned client is closed exactly once.
+    assert real_owned_client.is_closed
+    # (5) tracer shutdown ran after the registry aclose; the recorder only
+    #     sees the patched shutdown_tracer because the real
+    #     ``ProviderRegistry.aclose`` does not record to it (the stub
+    #     in the existing ``test_lifespan_aclose_before_tracer_shutdown``
+    #     covers the event-order contract; this test covers the
+    #     behavior-first contract on a real owned client).
+    assert recorder.events == [
+        "build_tracer",
+        "build_providers",
+        "shutdown_tracer",
+    ]
+
+
 # ----- 4.5 / 4.6 — /v1/models aggregation from app.state.providers ----------
 
 

@@ -2,12 +2,13 @@
 
 The lifespan owns the provider registry and the OpenTelemetry tracer. The
 construction order is fixed: ``build_tracer`` first (always), then
-``build_providers`` inside a try/finally so the tracer is shut down even when
-provider construction raises. When construction succeeds, the registry's
-``aclose()`` is invoked BEFORE ``shutdown_tracer()`` so the registry's owned
-HTTP clients are closed before the tracer's exporter flushes; when
-construction fails, the registry is the factory's responsibility (it cleans
-up partial clients) and the lifespan only runs tracer shutdown.
+``build_providers``. The registry's ``aclose()`` and ``shutdown_tracer()``
+run AFTER ``yield`` on the successful-startup path so the registry's
+owned HTTP clients stay open for the lifetime of request serving. When
+construction raises, the factory's ``BaseException`` cleanup closes
+partial clients, the lifespan runs ``shutdown_tracer()`` once, and the
+exception is re-raised so the registry's ownership invariant (a registry
+is only on ``app.state`` when complete) holds.
 
 A :class:`ChatTelemetry` is built alongside the tracer and stored on
 ``app.state.telemetry`` so the chat handler can pick it up. The
@@ -61,20 +62,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         meter = otel_metrics.get_meter(_TELEMETRY_INSTRUMENTATION_NAME)
         _app.state.telemetry = build_chat_telemetry(tracer=tracer, meter=meter)
         registry: ProviderRegistry | None = None
+        started = False
         try:
-            registry = await build_providers(resolved)
+            try:
+                registry = await build_providers(resolved)
+            except BaseException:
+                # Build-failure path: the factory's ``except BaseException``
+                # cleanup already closed every partial client, so only
+                # tracer shutdown remains. ``started`` stays False so the
+                # outer finally does not re-run shutdown_tracer or try to
+                # close a registry the factory never returned.
+                shutdown_tracer()
+                raise
+            _app.state.providers = registry
+            started = True
+            yield
         finally:
-            # Close the registry BEFORE the tracer flushes so the tracer's
-            # BatchSpanProcessor can record any closing span, and so we do
-            # not double-close clients: the factory's BaseException cleanup
-            # path closes partial clients and never returns a registry, so
-            # ``registry`` here is either a complete ProviderRegistry
-            # (whose clients it owns) or None (no clients to close).
-            if registry is not None:
-                await registry.aclose()
-            shutdown_tracer()
-        _app.state.providers = registry
-        yield
+            # Success path: the registry owns its clients and MUST stay
+            # open while serving requests, so the aclose + tracer
+            # shutdown that previously ran before ``yield`` is deferred
+            # until the lifespan exits. ``registry`` is a complete
+            # ``ProviderRegistry`` here (``build_providers`` either
+            # returned one or raised).
+            if started:
+                if registry is not None:
+                    await registry.aclose()
+                shutdown_tracer()
 
     app = FastAPI(title="LLMux", version=resolved.llmux_version, lifespan=lifespan)
     app.state.settings = resolved
