@@ -808,3 +808,224 @@ async def test_models_empty_when_no_providers() -> None:
         response = client.get("/v1/models")
     assert response.status_code == 200
     assert response.json() == {"object": "list", "data": []}
+
+
+# ----- 5.1 / 5.2 / 5.4 — PR5 chat routing + envelopes (no telemetry) --------
+
+
+def _app_with_registry(
+    monkeypatch: pytest.MonkeyPatch, registry: ProviderRegistry
+) -> FastAPI:
+    """Build a real ``create_app`` whose lifespan yields ``registry``."""
+    _patch_lifespan(monkeypatch, _Recorder(), registry_to_return=registry)
+    return create_app(
+        settings=Settings.model_construct(
+            llmux_host="127.0.0.1",
+            llmux_port=8000,
+            llmux_version="0.1.0",
+            llmux_providers_configured=[],
+            otel_service_name="llmux-test",
+            otel_exporter_otlp_endpoint="",
+        )
+    )
+
+
+def _post_chat(client: TestClient, **overrides: object) -> httpx.Response:
+    """POST a minimal non-streaming chat body, with optional overrides."""
+    body: dict[str, object] = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    body.update(overrides)
+    result: httpx.Response = client.post("/v1/chat/completions", json=body)
+    return result
+
+
+# 5.1 RED — stream=False routes to provider and returns 200 envelope ----------
+
+
+@pytest.mark.asyncio
+async def test_stream_false_routes_and_returns_200_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stream=false`` MUST route to the selected provider, return 200
+    with an OpenAI-shaped completion envelope, and forward ``stream=false``
+    on the upstream wire (spec: Non-Streaming Chat Completion Routing)."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=_ok_payload("hi back"))
+
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_chat(tc, stream=False)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        assert "text/event-stream" not in response.headers["content-type"]
+        body = response.json()
+        assert body["object"] == "chat.completion"
+        assert body["id"] == "chatcmpl-test"
+        assert body["model"] == "gpt-4o-mini"
+        assert body["choices"][0]["message"]["content"] == "hi back"
+        assert body["choices"][0]["finish_reason"] == "stop"
+        assert body["usage"]["prompt_tokens"] == 5
+        assert body["usage"]["completion_tokens"] == 1
+        # Upstream request carried stream=False (PR2 adapter contract).
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["stream"] is False
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omitted_stream_defaults_false_and_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting the ``stream`` field MUST treat it as ``stream=false`` and
+    route the request (Pydantic default + handler ``is True`` short-circuit).
+    The upstream wire MUST carry ``stream=false``."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=_ok_payload())
+
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            # No ``stream`` key in the request body — defaults via Pydantic.
+            response = tc.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["message"]["content"] == "hello"
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["stream"] is False
+    finally:
+        await client.aclose()
+
+
+# 5.2 / 5.3 RED — stream=True short-circuits to 501, no provider, no telemetry
+
+
+@pytest.mark.asyncio
+async def test_stream_true_returns_501_no_provider_no_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stream=true`` MUST return 501 with ``application/json`` (never
+    ``text/event-stream``) and no ``data:`` SSE frames. The provider MUST
+    NOT be invoked and no telemetry is emitted (PR5 ships no telemetry
+    at all, so this is implicit — the MockTransport handler is the
+    strongest evidence: zero upstream calls)."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json=_ok_payload("never reached"))
+
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_chat(tc, stream=True)
+        assert response.status_code == 501
+        assert response.headers["content-type"].startswith("application/json")
+        assert "text/event-stream" not in response.headers["content-type"]
+        assert "data:" not in response.text
+        # Strongest no-provider / no-telemetry evidence: the MockTransport
+        # handler is never invoked. The handler is the only place upstream
+        # is called from the chat path.
+        assert call_count["n"] == 0
+    finally:
+        await client.aclose()
+
+
+# 5.4 RED — typed LLMuxError envelopes ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_400_on_provider_selection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No provider offers the requested model → 400 ``model_not_found``;
+    envelope MUST NOT leak the requested model id (sanitization rule)."""
+    adapter, client = _make_adapter(
+        lambda r: httpx.Response(200, json=_ok_payload()),
+        models=("gpt-4o-mini",),
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_chat(tc, model="missing-model-LEAK")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "model_not_found"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["param"] is None
+        serialized = json.dumps(body)
+        assert "missing-model-LEAK" not in serialized
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_502_on_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Upstream 4xx/5xx → 502 ``upstream_error``; envelope MUST be
+    sanitized (no key, no upstream body, no stack trace)."""
+    secret_key = "sk-LEAK-1234"
+    secret_body = "internal-error-payload-LEAK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": secret_body, "key": secret_key})
+
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"]["code"] == "upstream_error"
+        serialized = json.dumps(body)
+        for token in (secret_key, secret_body, "Traceback", "File '"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_504_on_upstream_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx.TimeoutException from the adapter → 504 ``upstream_timeout``
+    with a sanitized envelope (timeout subclass maps to 504 per the
+    design's stable code map)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("slow", request=request)
+
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 504
+        body = response.json()
+        assert body["error"]["code"] == "upstream_timeout"
+    finally:
+        await client.aclose()

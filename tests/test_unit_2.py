@@ -155,22 +155,48 @@ def test_models_returns_openai_envelope_with_empty_data() -> None:
 
 
 # /v1/chat/completions ===================================================
+# PR5: stream=false (explicit or omitted via Pydantic default) now routes
+# to the selected provider; the no-fake-SSE 501 contract applies only to
+# explicit stream=true. With no app.state.providers (the bare-bones test
+# harness) the chat handler maps ConfigurationError → 502.
 
 
-@pytest.mark.parametrize("s", [False, True, None], ids=["false", "true", "omitted"])
-def test_chat_501_for_all_stream_modes(s: object) -> None:
-    body: dict[str, object] = {
-        "model": "gpt-4",
-        "messages": [{"role": "user", "content": "hi"}],
-    }
-    if s is not None:
-        body["stream"] = s
-    r = _client(chat_router).post("/v1/chat/completions", json=body)
+def test_chat_501_only_for_explicit_stream_true() -> None:
+    """Only explicit ``stream=true`` keeps the 501 no-fake-SSE contract;
+    the body MUST be JSON (never text/event-stream) with no ``data:`` SSE
+    frames, and the provider MUST NOT be invoked (bare-bones harness has
+    no app.state.providers, so any routing path would surface a 502)."""
+    r = _client(chat_router).post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
     assert r.status_code == 501
     assert r.headers["content-type"].startswith("application/json")
     assert "text/event-stream" not in r.headers["content-type"]
     assert "data:" not in r.text
     assert r.json() == NOT_IMPLEMENTED_ERROR
+
+
+def test_chat_502_when_no_registry_for_non_streaming() -> None:
+    """stream=false (and omitted) MUST route; with no app.state.providers
+    the handler maps ``ConfigurationError`` → 502 (never 400)."""
+    for body in (
+        {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+        {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+    ):
+        r = _client(chat_router).post("/v1/chat/completions", json=body)
+        assert r.status_code == 502, f"body={body} got {r.status_code}"
+        body_json = r.json()
+        assert body_json["error"]["code"] == "provider_configuration_error"
+        assert body_json["error"]["param"] is None
 
 
 # App factory + conftest client fixture ==================================
@@ -199,27 +225,59 @@ def test_create_app_resolves_settings_and_runs_lifespan(
 
 
 def test_create_app_mounts_all_three_v1_routes() -> None:
+    """All three ``/v1`` routes MUST be reachable from the factory app.
+    The bare settings have no providers, so a non-streaming chat request
+    MUST hit the routed path and surface a sanitized 502 (no app.state
+    .providers in this harness); explicit stream=true still short-circuits
+    to 501."""
     from llmux.main import create_app
 
     c = TestClient(create_app(settings=_s()))
     assert c.get("/v1/health").status_code == 200
     assert c.get("/v1/models").status_code == 200
-    assert (
-        c.post(
-            "/v1/chat/completions",
-            json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
-        ).status_code
-        == 501
+    # Non-streaming: routed → 502 (no registry in the bare harness).
+    routed = c.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
     )
+    assert routed.status_code == 502
+    # Explicit stream=true: 501 short-circuit.
+    streamed = c.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    assert streamed.status_code == 501
 
 
 def test_client_fixture_from_conftest_reaches_all_v1_routes(client: TestClient) -> None:
+    """Same coverage as ``test_create_app_mounts_all_three_v1_routes``,
+    exercised through the conftest ``client`` fixture. Its app has no
+    providers, so the registry is an empty ``ProviderRegistry``: a
+    non-streaming request hits ``select_provider`` → 400 selection miss;
+    explicit stream=true still short-circuits to 501."""
     assert client.get("/v1/health").status_code == 200
     assert client.get("/v1/models").status_code == 200
+    # Non-streaming: routed → 400 selection miss (empty registry).
     assert (
         client.post(
             "/v1/chat/completions",
             json={"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]},
+        ).status_code
+        == 400
+    )
+    # Explicit stream=true: 501 short-circuit.
+    assert (
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
         ).status_code
         == 501
     )
