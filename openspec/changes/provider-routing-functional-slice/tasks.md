@@ -35,11 +35,11 @@ Chain strategy: feature-branch-chain
 - [x] 2.2 RED: `upstream_4xx_5xx→upstream_error`, `timeout→upstream_timeout`
 - [x] 2.3 GREEN: create `core/providers/openai.py` (Protocol, injected `httpx.AsyncClient`)
 
-## PR3 — Registry + Partial-Construction Cleanup (base PR2)
+## PR3 — Registry + Partial-Construction Cleanup (base PR2) ✅
 
-- [ ] 3.1 RED: `registry_fail_fast_aborts`, `build_providers_closes_first_client_on_later_failure`
-- [ ] 3.2 RED: `aclose_closes_production_only`, `aclose_idempotent_after_success`
-- [ ] 3.3 GREEN: create `core/providers/registry.py` (`ProviderRegistry` + `build_providers` w/ cleanup seam)
+- [x] 3.1 RED: `registry_fail_fast_aborts`, `build_providers_closes_first_client_on_later_failure`
+- [x] 3.2 RED: `aclose_closes_production_only`, `aclose_idempotent_after_success`
+- [x] 3.3 GREEN: create `core/providers/registry.py` (`ProviderRegistry` + `build_providers` w/ cleanup seam)
 
 ## PR4 — Router + Lifespan + /v1/models (base PR3)
 

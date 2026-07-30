@@ -1,4 +1,4 @@
-"""Provider routing functional slice — PR1 (config + errors) + PR2 (OpenAI adapter)."""
+"""Provider routing functional slice: PR1+PR2+PR3 (config, errors, OpenAI, registry)."""
 
 from __future__ import annotations
 
@@ -26,6 +26,12 @@ from llmux.core.providers.base import (
     ProviderAdapter,
 )
 from llmux.core.providers.openai import OpenAIAdapter
+from llmux.core.providers.registry import (
+    ClientFactory,
+    ProviderRegistry,
+    RegistryEntry,
+    build_providers,
+)
 
 _OPENAI_ENV = (
     "LLMUX_PROVIDERS_CONFIGURED",
@@ -393,3 +399,210 @@ async def test_openai_health_reflects_outcome(
     finally:
         await client.aclose()
     assert isinstance(h, HealthStatus) and h.healthy is healthy
+
+
+# ----- 3.1 / 3.2 / 3.3 — ProviderRegistry + build_providers -----------------
+
+
+class _CountingClient(httpx.AsyncClient):
+    """``httpx.AsyncClient`` with a per-instance ``aclose()`` counter."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.aclose_count = 0
+
+    async def aclose(self) -> None:
+        self.aclose_count += 1
+        await super().aclose()
+
+
+def _counting_factory(sink: list[_CountingClient]) -> ClientFactory:
+    """Factory that returns a fresh ``_CountingClient`` per call."""
+
+    def factory() -> httpx.AsyncClient:
+        client = _CountingClient()
+        sink.append(client)
+        return client
+
+    return factory
+
+
+def _settings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    providers: str,
+    models: str = "gpt-4o-mini",
+) -> Settings:
+    """Build a valid ``Settings`` with the requested provider list."""
+    _enable(monkeypatch, models=models)
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", providers)
+    return Settings()  # type: ignore[call-arg]
+
+
+# 3.1 RED — fail-fast construction, no partial registry ----------------------
+
+
+@pytest.mark.asyncio
+async def test_build_providers_closes_first_client_on_later_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic factory seam: 1st provider builds, 2nd is unknown.
+    The injected factory is called once; the 1st client MUST be closed
+    exactly once (no double-close, no leak) before ConfigurationError.
+    """
+    clients: list[_CountingClient] = []
+    settings = _settings(monkeypatch, providers="openai,anthropic")
+    with pytest.raises(ConfigurationError) as exc:
+        await build_providers(settings, client_factory=_counting_factory(clients))
+    assert "anthropic" in str(exc.value)
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_registry_fail_fast_aborts_on_duplicate_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate slugs MUST raise ConfigurationError; the 1st client
+    is still cleaned up exactly once (transaction-like guarantee)."""
+    clients: list[_CountingClient] = []
+    settings = _settings(monkeypatch, providers="openai,openai")
+    with pytest.raises(ConfigurationError) as exc:
+        await build_providers(settings, client_factory=_counting_factory(clients))
+    assert "openai" in str(exc.value)
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_build_providers_cleans_up_on_adapter_ctor_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-ConfigurationError exceptions after a client is created MUST
+    still trigger cleanup (proves ``except BaseException`` covers the gap)."""
+    from llmux.core.providers import registry as registry_mod
+
+    clients: list[_CountingClient] = []
+    settings = _settings(monkeypatch, providers="openai")
+
+    def boom(**_kw: object) -> OpenAIAdapter:
+        raise RuntimeError("simulated ctor failure")
+
+    monkeypatch.setattr(registry_mod, "OpenAIAdapter", boom)
+    with pytest.raises(RuntimeError):
+        await build_providers(settings, client_factory=_counting_factory(clients))
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_build_providers_empty_config_returns_empty_registry() -> None:
+    """Empty LLMUX_PROVIDERS_CONFIGURED returns an empty registry; aclose
+    is a safe no-op (no clients to close)."""
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.llmux_providers_configured == []
+    clients: list[_CountingClient] = []
+    registry = await build_providers(
+        settings, client_factory=_counting_factory(clients)
+    )
+    assert registry.providers == () and await registry.models() == ()
+    assert clients == []
+    await registry.aclose()
+    await registry.aclose()  # idempotent on empty too
+
+
+# 3.2 RED — aclose ownership + idempotency ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_production_only() -> None:
+    """aclose closes only entries with an owned client; caller-supplied
+    (e.g. MockTransport) clients are NEVER re-closed by the registry."""
+    production_client = httpx.AsyncClient()
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"data": []}))
+    )
+    try:
+        prod_adapter = OpenAIAdapter(
+            client=production_client,
+            api_key=SecretStr("sk-prod"),
+            base_url="https://api.openai.com/v1",
+            models=("gpt-4o-mini",),
+            timeout_s=10.0,
+        )
+        mock_adapter = OpenAIAdapter(
+            client=mock_client,
+            api_key=SecretStr("sk-mock"),
+            base_url="https://api.openai.com/v1",
+            models=("gpt-4o-mini",),
+            timeout_s=10.0,
+        )
+        registry = ProviderRegistry(
+            (
+                RegistryEntry(adapter=prod_adapter, client=production_client),
+                RegistryEntry(adapter=mock_adapter, client=None),
+            )
+        )
+        await registry.aclose()
+        assert production_client.is_closed
+        assert not mock_client.is_closed, "caller-owned client NOT re-closed"
+    finally:
+        if not mock_client.is_closed:
+            await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_idempotent_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated aclose() calls are safe no-ops; the owned client is
+    closed exactly once across many calls (proves no double-close)."""
+    clients: list[_CountingClient] = []
+    settings = _settings(monkeypatch, providers="openai")
+    registry = await build_providers(
+        settings, client_factory=_counting_factory(clients)
+    )
+    for _ in range(5):
+        await registry.aclose()
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_registry_models_aggregates_across_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """registry.models() concatenates per-adapter models in order."""
+    settings = _settings(monkeypatch, providers="openai", models="gpt-4o-mini,gpt-4o")
+    clients: list[_CountingClient] = []
+    registry = await build_providers(
+        settings, client_factory=_counting_factory(clients)
+    )
+    try:
+        models = await registry.models()
+    finally:
+        await registry.aclose()
+    assert tuple(m.id for m in models) == ("gpt-4o-mini", "gpt-4o")
+    assert all(m.provider == "openai" for m in models)
+
+
+# 3.3 GREEN — production harness with the default factory ------------------
+
+
+@pytest.mark.asyncio
+async def test_build_providers_default_factory_creates_and_closes_real_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end production harness: default factory creates a real
+    httpx.AsyncClient; aclose() closes it exactly once; subsequent
+    aclose() calls are idempotent. Proves the full ownership contract
+    in production form without a network."""
+    settings = _settings(monkeypatch, providers="openai")
+    registry = await build_providers(settings)  # default factory
+    adapter = registry.providers[0]
+    assert isinstance(adapter, OpenAIAdapter)
+    real_client = adapter._client  # noqa: SLF001
+    assert isinstance(real_client, httpx.AsyncClient) and not real_client.is_closed
+    await registry.aclose()
+    assert real_client.is_closed
+    await registry.aclose()
+    await registry.aclose()

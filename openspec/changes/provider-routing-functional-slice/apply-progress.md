@@ -73,3 +73,28 @@
 - **Import**: `python -c "from llmux.core.providers.openai import OpenAIAdapter; from llmux.core.providers.base import ProviderAdapter, CompletionResult, HealthStatus, ModelInfo; assert isinstance(OpenAIAdapter.__new__(OpenAIAdapter), ProviderAdapter)"` → `OK`.
 - **Live MockTransport harness**: real `httpx.AsyncClient(transport=httpx.MockTransport(handler))`, three async calls (`complete`+`models`+`health`) on one caller-owned client inside `async with`, 0 network bytes, 0 client leaks → `LIVE HARNESS OK`.
 - **Rollback / no test-client double-close**: drop `openai.py`; revert the test additions. PR1 baseline untouched; no new dep, no env var, no FastAPI route. Every PR2 test calls `await client.aclose()` exactly once in `finally`; the adapter never closes the injected client — verified by the live harness and by the Protocol (no `aclose` exposed).
+
+---
+
+# PR3 — ProviderRegistry + transaction-like build_providers (base PR2) ✅
+
+**Branch**: `feat/provider-routing-functional-slice-03-registry` (base = PR2 merge `df7c155`, child of tracker). **Scope**: ordered `ProviderRegistry` with `RegistryEntry(adapter, client)` ownership signaling; idempotent `aclose()` that closes only factory-owned clients; async `build_providers(settings, *, client_factory=...)` with duplicate / unknown / missing-key validation and `except BaseException` cleanup that closes every client already created before re-raising. No router, no lifespan, no endpoints, no telemetry.
+
+- [x] 3.1 RED: `build_providers_closes_first_client_on_later_failure` (deterministic factory seam), `registry_fail_fast_aborts_on_duplicate_slug`, `build_providers_cleans_up_on_adapter_ctor_failure` (BaseException path), `build_providers_empty_config_returns_empty_registry`
+- [x] 3.2 RED: `aclose_closes_production_only` (mixed owned+caller-supplied entries), `aclose_idempotent_after_success` (5× aclose, count==1), `registry_models_aggregates_across_providers`
+- [x] 3.3 GREEN: create `core/providers/registry.py` (`ProviderRegistry` + `RegistryEntry` + `build_providers` w/ cleanup seam + `ClientFactory` seam + default factory)
+
+**Files (this PR)**:
+- `src/llmux/core/providers/registry.py` (created, 131 LoC).
+- `tests/test_provider_routing_slice.py` (extended, +8 behavior tests): `_CountingClient` (per-instance `aclose_count`); `_counting_factory`; `_settings(monkeypatch, providers=...)` helper.
+- `openspec/changes/.../tasks.md` (modified): PR3 marked `[x]`.
+
+**Work Unit Evidence**:
+- **Focused**: `uv run pytest tests/test_provider_routing_slice.py -k "registry or build_providers or aclose" -v` → `8 passed`.
+- **Full + coverage**: `uv run pytest -q --cov=llmux --cov-fail-under=90` → `63 passed`; total `98.66%`; **`registry.py` = 100% (58/58 stmts, 0 missed)**.
+- **Ruff + Mypy**: `uv run ruff format src tests && uv run ruff check src tests` → `All checks passed!`; `uv run mypy src tests` → `Success: no issues found in 18 source files` (strict).
+- **Import harness**: `uv run python -c "from llmux.core.providers.registry import ProviderRegistry, RegistryEntry, build_providers, ClientFactory; ..."` + signature assertions → `IMPORT HARNESS OK`.
+- **Runtime cleanup harness**: real `Settings(LLMUX_PROVIDERS_CONFIGURED='openai', OPENAI_API_KEY='sk-harness', OPENAI_MODELS='gpt-4o-mini')` → `await build_providers(s)` (default factory creates real `httpx.AsyncClient`) → assert `not is_closed` → `aclose()` → assert `is_closed` → 2× more `aclose()` (idempotent) → `RUNTIME CLEANUP HARNESS OK`.
+- **No double-close**: `_CountingClient.aclose_count == 1` asserted on every test that exercises cleanup OR aclose (cleanup path AND registry path); mixed-ownership test asserts `mock_client.is_closed is False` after aclose — caller-owned clients are never re-closed.
+- **Deterministic factory seam**: `test_build_providers_closes_first_client_on_later_failure` — `["openai","anthropic"]` + `_counting_factory` → 1 factory call, 2nd slug unknown, 1st client `is_closed and aclose_count == 1`, no registry returned.
+- **Rollback**: drop `registry.py`; revert test additions; revert `tasks.md` and this section. PR1+PR2 baseline untouched; no router, no lifespan, no endpoint, no telemetry, no new env var or dep.
