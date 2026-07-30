@@ -8,8 +8,14 @@ completion envelope, or one of the documented error envelopes
 ``stream=true`` short-circuits to a JSON 501 *before* any provider call
 or telemetry work, preserving the no-fake-SSE contract.
 
-No telemetry is emitted in this PR — the bounded OTel span, the three
-metrics, and the ``MODEL_UNKNOWN`` sentinel land in PR6.
+Each non-streaming hop is wrapped in a :class:`ChatCompletionTimer` that
+records one ``chat.completion`` span and three bounded-cardinality
+metrics (``requests_total``, ``errors_total``, ``duration_seconds``).
+Selection misses use the :data:`MODEL_UNKNOWN` sentinel so an unknown
+model never explodes the time-series count. Errors set the span to
+``Status(StatusCode.ERROR, error_type)`` with an ``error.type``
+attribute; the description is the bounded label, never the raw
+exception message or stack trace.
 """
 
 from __future__ import annotations
@@ -24,6 +30,13 @@ from llmux.core.errors import LLMuxError, to_openai_envelope
 from llmux.core.providers.base import CompletionResult
 from llmux.core.providers.registry import ProviderRegistry
 from llmux.core.router import select_provider
+from llmux.observability.metrics import (
+    MODEL_UNKNOWN,
+    PROVIDER_NONE,
+    ChatCompletionTimer,
+    ChatTelemetry,
+    NoopChatTelemetry,
+)
 
 chat_router = APIRouter()
 
@@ -35,6 +48,8 @@ NOT_IMPLEMENTED_ERROR: dict[str, object] = {
         "code": "not_implemented",
     },
 }
+
+_NOOP_TELEMETRY: NoopChatTelemetry = NoopChatTelemetry()
 
 
 class ChatMessage(BaseModel):
@@ -80,39 +95,85 @@ async def post_chat_completion(
     """Route a chat completion request to the selected provider.
 
     - ``stream`` explicitly ``True`` → 501 ``not_implemented`` JSON
-      (no provider call, no telemetry, no SSE).
+      (no provider call, no telemetry, no SSE) — short-circuited
+      BEFORE the telemetry timer is opened so the rejected path is
+      never recorded (per the no-fake-SSE contract).
     - ``stream`` ``False`` (explicit or omitted → Pydantic default) →
-      async first-match ``select_provider`` then ``adapter.complete``;
-      200 OpenAI-shaped envelope on success, sanitized ``LLMuxError``
-      envelope on typed failure.
+      async first-match ``select_provider`` then ``adapter.complete``
+      wrapped in a :class:`ChatCompletionTimer`. 200 OpenAI-shaped
+      envelope on success, sanitized ``LLMuxError`` envelope on typed
+      failure. A non-``LLMuxError`` exception is caught by the timer,
+      recorded as ``error.type=internal_error`` + ``Status(ERROR)``,
+      then re-raised so FastAPI returns a 500.
     """
+    # 1. Explicit stream=true short-circuit — MUST run before any
+    #    telemetry work so the rejected path emits no span or metric.
     if body.stream is True:
         return JSONResponse(
             status_code=501,
             content=NOT_IMPLEMENTED_ERROR,
             media_type="application/json",
         )
-    registry: ProviderRegistry | None = getattr(request.app.state, "providers", None)
-    if registry is None:
-        # Lifespan never ran (test harness without lifespan) — treat as
-        # a startup configuration fault per the spec's ConfigurationError
-        # mapping (502, never 400).
-        from llmux.core.errors import ConfigurationError
-
-        return _error_response(ConfigurationError("providers not initialized"))
-    try:
-        adapter = await select_provider(body.model, registry)
-        result = await adapter.complete(
-            body.model,
-            [m.model_dump(exclude_none=True) for m in body.messages],
-        )
-    except LLMuxError as exc:
-        return _error_response(exc)
-    return JSONResponse(
-        status_code=200,
-        content=_completion_envelope(result),
-        media_type="application/json",
+    telemetry: ChatTelemetry | NoopChatTelemetry = getattr(
+        request.app.state, "telemetry", _NOOP_TELEMETRY
     )
+    registry: ProviderRegistry | None = getattr(request.app.state, "providers", None)
+    # 2. Open the chat-completion timer. MODEL_UNKNOWN until selection
+    #    resolves; the timer accepts the setters below to update the
+    #    canonical post-routing provider/model/error_type.
+    with telemetry.start(provider=None, model=MODEL_UNKNOWN) as timer:
+        if not isinstance(timer, ChatCompletionTimer):
+            # NoopChatTelemetry returns a different timer shape; both
+            # expose the same setters, so the call shape is uniform.
+            pass
+        if registry is None:
+            # Lifespan never ran (test harness without lifespan) —
+            # treat as a startup configuration fault per the spec's
+            # ConfigurationError mapping (502, never 400).
+            from llmux.core.errors import ConfigurationError
+
+            err = ConfigurationError("providers not initialized")
+            timer.set_error_type(type(err).error_type)
+            timer.mark_error()
+            return _error_response(err)
+        try:
+            adapter = await select_provider(body.model, registry)
+        except LLMuxError as exc:
+            # model label stays MODEL_UNKNOWN for selection miss so the
+            # bounded set never sees the raw request model.
+            timer.set_error_type(type(exc).error_type)
+            timer.mark_error()
+            return _error_response(exc)
+        # The Protocol does not require ``name`` (it would break
+        # ``issubclass`` on ``runtime_checkable`` Protocols). The bounded
+        # PROVIDER_NONE sentinel is the fallback for adapters that do
+        # not expose ``name`` so the metric label never escapes the
+        # bounded set.
+        timer.set_provider(getattr(adapter, "name", PROVIDER_NONE))
+        # The model label is the request model as soon as the router
+        # has selected a provider. This MUST be set BEFORE the adapter
+        # call so an unexpected (non-LLMuxError) exception bubbling
+        # out of the adapter still records the request model on the
+        # error metric — the bounded set stays bounded and
+        # MODEL_UNKNOWN is reserved for the selection-miss branch.
+        timer.set_model(body.model)
+        try:
+            result = await adapter.complete(
+                body.model,
+                [m.model_dump(exclude_none=True) for m in body.messages],
+            )
+        except LLMuxError as exc:
+            timer.set_error_type(type(exc).error_type)
+            timer.mark_error()
+            return _error_response(exc)
+        # On success the model label is the canonical result model
+        # returned by the provider, not the request model.
+        timer.set_model(result.model)
+        return JSONResponse(
+            status_code=200,
+            content=_completion_envelope(result),
+            media_type="application/json",
+        )
 
 
 __all__: list[str] = ["chat_router", "post_chat_completion", "NOT_IMPLEMENTED_ERROR"]

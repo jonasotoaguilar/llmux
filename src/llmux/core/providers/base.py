@@ -7,7 +7,16 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class ProviderAdapter(Protocol):
-    """Abstract port for LLM provider adapters."""
+    """Abstract port for LLM provider adapters.
+
+    Concrete adapters expose a ``name`` class attribute (e.g.
+    ``name = "openai"``) for telemetry labelling. The attribute is
+    intentionally not part of the Protocol because ``runtime_checkable``
+    Protocols with non-method members do not support ``issubclass``;
+    callers that need the bounded ``provider`` label read it via
+    ``getattr(adapter, "name", PROVIDER_NONE)`` (see
+    ``llmux.observability.metrics`` for the bounded sentinel).
+    """
 
     async def complete(
         self,

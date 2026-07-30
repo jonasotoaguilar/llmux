@@ -7,12 +7,19 @@ wiring, and the /v1/models endpoint.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from typing import TypedDict
 from urllib.parse import quote
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace.status import StatusCode
 from pydantic import SecretStr
 from starlette.testclient import TestClient
 
@@ -26,6 +33,7 @@ from llmux.core.errors import (
     to_openai_envelope,
 )
 from llmux.core.providers.base import (
+    Chunk,
     CompletionResult,
     HealthStatus,
     ModelInfo,
@@ -41,6 +49,7 @@ from llmux.core.providers.registry import (
 from llmux.core.router import select_provider
 from llmux.main import create_app
 from llmux.observability import tracing as tracing_mod
+from llmux.observability.metrics import ChatTelemetry
 
 _OPENAI_ENV = (
     "LLMUX_PROVIDERS_CONFIGURED",
@@ -683,12 +692,22 @@ def _patch_lifespan(
     raise_on_build: BaseException | None = None,
     registry_to_return: object = None,
 ) -> None:
-    """Patch build_tracer/shutdown_tracer/build_providers in main + tracing."""
+    """Patch build_tracer/shutdown_tracer/build_providers in main + tracing.
+
+    The fake ``build_tracer`` returns a real (noop) OTel ``Tracer`` so
+    the lifespan's ``build_chat_telemetry`` accepts it and the chat
+    handler can still call ``start_as_current_span`` without raising.
+    Tests that need to assert on telemetry use the public
+    ``_make_chat_telemetry`` helper (in-memory fakes) and inject the
+    result via ``app.state.telemetry`` after the lifespan runs.
+    """
+    from opentelemetry import trace as _otel_trace
+
     import llmux.main as main_mod
 
     def fake_build_tracer(_settings: object) -> object:
         recorder.events.append("build_tracer")
-        return object()
+        return _otel_trace.get_tracer("llmux-test")
 
     def fake_shutdown_tracer() -> None:
         recorder.events.append("shutdown_tracer")
@@ -1027,5 +1046,480 @@ async def test_chat_504_on_upstream_timeout(
         assert response.status_code == 504
         body = response.json()
         assert body["error"]["code"] == "upstream_timeout"
+    finally:
+        await client.aclose()
+
+
+# ----- 6.1 / 6.2 / 6.5 — PR6 telemetry: span + 3 metrics + sentinel + error --
+
+
+def _make_chat_telemetry() -> tuple[
+    ChatTelemetry, InMemorySpanExporter, InMemoryMetricReader
+]:
+    """Build a public-Otel :class:`ChatTelemetry` wired to in-memory
+    fakes (no private OTel global mutation).
+
+    Returns ``(telemetry, span_exporter, metric_reader)``. Tests verify
+    on the exporters/readers after the routed call.
+    """
+    from opentelemetry.sdk.metrics import MeterProvider as _MeterProvider
+    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    span_exporter = InMemorySpanExporter()
+    tracer_provider = _TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    tracer = tracer_provider.get_tracer("llmux-test")
+    reader = InMemoryMetricReader()
+    meter_provider = _MeterProvider(metric_readers=[reader])
+    meter = meter_provider.get_meter("llmux-test")
+    return ChatTelemetry(tracer=tracer, meter=meter), span_exporter, reader
+
+
+def _chat_spans(span_exporter: InMemorySpanExporter) -> list[ReadableSpan]:
+    """Return the chat-completion spans recorded so far."""
+    return [
+        s for s in span_exporter.get_finished_spans() if s.name == "chat.completion"
+    ]
+
+
+def _span_attrs(span: ReadableSpan) -> dict[str, str]:
+    """Return the span attributes as a plain ``dict`` (the OTel type
+    is ``Attributes`` / ``Mapping[str, AttributeValue] | None``; tests
+    only need ``dict`` semantics with str keys/values)."""
+    if span.attributes is None:
+        return {}
+    return {str(k): str(v) if v is not None else "" for k, v in span.attributes.items()}
+
+
+class _MetricPoint(TypedDict):
+    """Typed shape of one data point as returned by
+    :func:`_metric_data_points` (a plain ``dict`` for ergonomic
+    assertions but with stable types so mypy strict mode is happy)."""
+
+    attrs: dict[str, str]
+    value: object  # OTel data point value: int for counters, dict for histograms
+
+
+def _metric_data_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[_MetricPoint]:
+    """Return the recorded ``metric_name`` data points.
+
+    Robust against InMemoryMetricReader returning ``None`` (no data yet)
+    and against absent metrics (test misconfiguration). The value
+    field carries the OTel data point value: a counter has ``int``;
+    a histogram has ``dict(count=..., sum=...)``."""
+    data = reader.get_metrics_data()
+    if data is None:
+        return []
+    out: list[_MetricPoint] = []
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for m in sm.metrics:
+                if m.name != metric_name:
+                    continue
+                for dp in m.data.data_points:
+                    attrs: dict[str, str] = {
+                        str(k): (str(v) if v is not None else "")
+                        for k, v in (dp.attributes or {}).items()
+                    }
+                    value = getattr(dp, "value", None)
+                    if value is None:
+                        # Histogram: use count + sum; counter: use value.
+                        value = {
+                            "count": getattr(dp, "count", None),
+                            "sum": getattr(dp, "sum", None),
+                        }
+                    out.append({"attrs": attrs, "value": value})
+    return out
+
+
+# 6.1 RED — bounded model label and bounded label-value set -----------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_model_unknown_sentinel_on_unselected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request for a model no provider offers MUST be recorded with the
+    ``MODEL_UNKNOWN`` sentinel on the model label — never the raw
+    request model. The selection-miss envelope and span status are
+    unchanged, but the bounded ``model`` label keeps the time-series
+    count flat regardless of how many distinct unknown models the
+    gateway sees."""
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    raw_model = "not-offered-LEAK-sentinel-cardinality-12345"
+    adapter, client = _make_adapter(
+        lambda r: httpx.Response(200, json=_ok_payload()),
+        models=("gpt-4o-mini",),
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            # Inject the test telemetry AFTER the lifespan runs so the
+            # noop ChatTelemetry created by the lifespan is replaced
+            # with the in-memory fakes.
+            app.state.telemetry = telemetry
+            response = _post_chat(tc, model=raw_model)
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "model_not_found"
+        # The error envelope MUST NOT leak the raw request model
+        # (sanitization rule); the metric uses the sentinel instead.
+        assert raw_model not in json.dumps(body)
+        # Exactly one chat span with provider=none, model=unknown.
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 1
+        span = spans[0]
+        assert _span_attrs(span).get("provider") == "none"
+        assert _span_attrs(span).get("model") == "unknown"
+        assert _span_attrs(span).get("outcome") == "error"
+        assert _span_attrs(span).get("error.type") == "invalid_request_error"
+        # The metric labels carry the bounded sentinel, not the raw model.
+        for name in (
+            "chat_completion_requests_total",
+            "chat_completion_errors_total",
+            "chat_completion_duration_seconds",
+        ):
+            points = _metric_data_points(metric_reader, name)
+            assert points, f"metric {name} not recorded"
+            for p in points:
+                assert p["attrs"].get("model") == "unknown", (
+                    f"{name} leaked raw model: {p['attrs']}"
+                )
+                assert p["attrs"].get("provider") == "none"
+                assert raw_model not in json.dumps(p["attrs"], default=str)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every label value on every emitted metric MUST be drawn from a
+    fixed, bounded set. The set of providers comes from the
+    configured adapters (``openai``) plus the :data:`PROVIDER_NONE`
+    sentinel; the set of models comes from the configured model list
+    plus :data:`MODEL_UNKNOWN`; ``outcome`` is in {success, error};
+    ``error.type`` is in the class-level set of LLMuxError error
+    types plus the :data:`INTERNAL_ERROR_TYPE` sentinel. A free-form
+    caller-provided model id MUST NEVER reach a label position."""
+    telemetry, _, metric_reader = _make_chat_telemetry()
+    adapter, client = _make_adapter(
+        lambda r: httpx.Response(200, json=_ok_payload()),
+        models=("gpt-4o-mini",),
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            # Force a selection miss with a free-form model id.
+            _post_chat(tc, model="some-arbitrary-unknown-model")
+        bounded_providers = {"openai", "none"}
+        bounded_models = {"gpt-4o-mini", "unknown"}
+        bounded_outcomes = {"success", "error"}
+        bounded_error_types = {
+            "api_error",
+            "invalid_request_error",
+            "internal_error",
+            "none",
+        }
+        for name in (
+            "chat_completion_requests_total",
+            "chat_completion_errors_total",
+            "chat_completion_duration_seconds",
+        ):
+            for point in _metric_data_points(metric_reader, name):
+                attrs = point["attrs"]
+                assert attrs.get("provider") in bounded_providers, (
+                    f"{name} provider label {attrs.get('provider')!r} not bounded"
+                )
+                assert attrs.get("model") in bounded_models, (
+                    f"{name} model label {attrs.get('model')!r} not bounded"
+                )
+                assert attrs.get("outcome") in bounded_outcomes, (
+                    f"{name} outcome label {attrs.get('outcome')!r} not bounded"
+                )
+                if "error.type" in attrs:
+                    assert attrs["error.type"] in bounded_error_types, (
+                        f"{name} error.type {attrs['error.type']!r} not bounded"
+                    )
+    finally:
+        await client.aclose()
+
+
+# 6.2 RED — span error status with error.type attribute ---------------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_span_error_status_with_error_type_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed call that ends in :class:`UpstreamError` MUST emit a
+    span with ``Status(StatusCode.ERROR, error_type)`` AND an
+    ``error.type`` attribute carrying the same bounded label. The
+    status description is the bounded ``error_type`` (NOT the
+    upstream payload, key, or exception message) so the sanitization
+    contract holds for the span as well as the response envelope."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"error": "internal-error-payload-LEAK", "key": "sk-LEAK-1234"},
+        )
+
+    telemetry, span_exporter, _ = _make_chat_telemetry()
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            response = _post_chat(tc)
+        assert response.status_code == 502
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.status.status_code == StatusCode.ERROR
+        # The status description is the bounded error.type label, NOT
+        # the exception message or upstream payload.
+        assert span.status.description == "api_error"
+        assert _span_attrs(span).get("error.type") == "api_error"
+        assert _span_attrs(span).get("provider") == "openai"
+        assert _span_attrs(span).get("model") == "gpt-4o-mini"
+        assert _span_attrs(span).get("outcome") == "error"
+        # No leak of the upstream body or key on the span itself.
+        serialized = json.dumps(
+            {
+                "description": span.status.description,
+                "attrs": _span_attrs(span),
+            },
+            default=str,
+        )
+        for token in ("sk-LEAK-1234", "internal-error-payload-LEAK", "Traceback"):
+            assert token not in serialized, f"span leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+# 6.5 RED — unexpected exceptions are recorded as internal_error and propagate
+
+
+class _RaisingAdapter:
+    """A test-only ProviderAdapter that raises a non-LLMuxError from
+    ``complete()`` so we can prove the timer records the bounded
+    ``internal_error`` label and re-raises. Satisfies the runtime
+    Protocol (no ``name`` attribute — the chat handler must fall back
+    to the bounded PROVIDER_NONE sentinel for the metric label)."""
+
+    name: str = "openai"
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def complete(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, object]],
+        options: Mapping[str, object] | None = None,
+    ) -> CompletionResult:
+        raise self._exc
+
+    def complete_stream(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, object]],
+        options: Mapping[str, object] | None = None,
+    ) -> AsyncIterator[Chunk]:
+        raise NotImplementedError
+
+    async def models(self) -> Sequence[ModelInfo]:
+        return (
+            ModelInfo(id="gpt-4o-mini", provider="openai", supports_streaming=False),
+        )
+
+    async def health(self) -> HealthStatus:
+        return HealthStatus(healthy=True)
+
+
+@pytest.mark.asyncio
+async def test_telemetry_unexpected_error_records_error_metric_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the routed call raises a non-:class:`LLMuxError` (e.g. a
+    bare ``RuntimeError`` from a buggy adapter), the timer MUST:
+
+    * record the error counter with the bounded ``internal_error``
+      label,
+    * set the span to ``Status(StatusCode.ERROR, "internal_error")``,
+    * record the ``error.type`` span attribute as ``internal_error``,
+    * re-raise so FastAPI returns a 500 (the timer MUST NOT swallow
+      the exception).
+
+    The bounded sentinel guarantees the error counter's
+    ``error.type`` label never sees caller-provided exception text or
+    stack trace data."""
+
+    adapter = _RaisingAdapter(RuntimeError("unexpected boom"))
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=_ok_payload()))
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            with pytest.raises(RuntimeError, match="unexpected boom"):
+                _post_chat(tc)
+        # Error counter recorded with the bounded internal_error label.
+        errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
+        assert len(errors) == 1, f"expected 1 error point, got {errors}"
+        attrs = errors[0]["attrs"]
+        assert attrs.get("error.type") == "internal_error"
+        assert attrs.get("outcome") == "error"
+        assert attrs.get("provider") == "openai"
+        assert attrs.get("model") == "gpt-4o-mini"
+        # Duration histogram ALSO recorded (error path is not skipped).
+        durations = _metric_data_points(
+            metric_reader, "chat_completion_duration_seconds"
+        )
+        assert len(durations) == 1
+        assert durations[0]["attrs"].get("error.type") == "internal_error"
+        # Span has Status(ERROR, "internal_error") and the bounded attribute.
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.status.status_code == StatusCode.ERROR
+        assert span.status.description == "internal_error"
+        assert _span_attrs(span).get("error.type") == "internal_error"
+        # Caller-supplied exception text MUST NOT reach the span.
+        serialized = json.dumps(
+            {
+                "description": span.status.description,
+                "attrs": _span_attrs(span),
+            },
+            default=str,
+        )
+        assert "unexpected boom" not in serialized
+        assert "Traceback" not in serialized
+    finally:
+        await client.aclose()
+
+
+# 6.3 / 6.4 GREEN — chat.completion span + 3 metrics + canonical model on success
+
+
+@pytest.mark.asyncio
+async def test_telemetry_chat_span_and_three_metrics_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful routed call MUST emit exactly one ``chat.completion``
+    span and three metric data points (one per instrument) with the
+    canonical result model from :class:`CompletionResult` (NOT the
+    request model) so the metric label reflects what the upstream
+    actually used. ``error.type`` is the bounded ``"none"`` sentinel
+    on the success branch."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "model": "gpt-4o-2024-05-13-canonical",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            response = _post_chat(tc, model="gpt-4o-mini")
+        assert response.status_code == 200
+        # Exactly one chat.completion span.
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 1
+        span = spans[0]
+        # Canonical result model is the label, not the request model.
+        assert _span_attrs(span).get("model") == "gpt-4o-2024-05-13-canonical"
+        assert _span_attrs(span).get("provider") == "openai"
+        assert _span_attrs(span).get("outcome") == "success"
+        assert _span_attrs(span).get("error.type") == "none"
+        # Span status is UNSET (not ERROR, not OK) for the success branch
+        # per OTel best practice — neither an error nor an explicit OK.
+        assert span.status.status_code == StatusCode.UNSET
+        # The request counter and the duration histogram are both
+        # incremented per hop (one data point each). The error counter
+        # MUST NOT be incremented on the success branch (zero data
+        # points with ``outcome="error"`` is the success invariant).
+        for name in (
+            "chat_completion_requests_total",
+            "chat_completion_duration_seconds",
+        ):
+            points = _metric_data_points(metric_reader, name)
+            assert len(points) == 1, f"{name}: expected 1 point, got {len(points)}"
+            attrs = points[0]["attrs"]
+            assert attrs.get("model") == "gpt-4o-2024-05-13-canonical"
+            assert attrs.get("provider") == "openai"
+        # errors_total MUST NOT be incremented on success. The metric
+        # is registered at ChatTelemetry construction time (so the
+        # instrument is exposed), but no data point is emitted until
+        # an actual error path increments the counter.
+        errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
+        for p in errors:
+            assert p["attrs"].get("outcome") != "error", (
+                "errors_total must not be incremented on success"
+            )
+    finally:
+        await client.aclose()
+
+
+# 6.3 / 6.4 GREEN — explicit stream=true still bypasses all telemetry ---------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stream_true_still_bypasses_all_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``stream=true`` MUST short-circuit to a JSON 501 BEFORE
+    the telemetry timer opens — so the rejected path emits no span,
+    no metric, and no upstream call. The MockTransport handler is
+    the strongest evidence: zero invocations."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ok_payload())
+
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    adapter, client = _make_adapter(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            response = _post_chat(tc, stream=True)
+        assert response.status_code == 501
+        # No chat span, no metrics.
+        assert _chat_spans(span_exporter) == []
+        for name in (
+            "chat_completion_requests_total",
+            "chat_completion_errors_total",
+            "chat_completion_duration_seconds",
+        ):
+            assert _metric_data_points(metric_reader, name) == [], (
+                f"stream=true leaked {name}"
+            )
     finally:
         await client.aclose()

@@ -60,12 +60,12 @@ Chain strategy: feature-branch-chain
 
 ## PR6 — OTel + Metrics + Cardinality + Error Accounting (base PR5)
 
-- [ ] 6.1 RED: `model_unknown_sentinel_on_unselected`, `bounded_label_values`
-- [ ] 6.2 RED: `span_error_status_with_error_type_attribute`
-- [ ] 6.3 GREEN: create `observability/metrics.py` (span `chat.completion`, 3 metrics, `MODEL_UNKNOWN`)
-- [ ] 6.4 GREEN: wire `ChatTelemetry` into `api/chat.py` routed call site
-- [ ] 6.5 RED: `unexpected_error_records_error_metric_and_propagates`
-- [ ] 6.6 GREEN: re-raise non-`LLMuxError` after error telemetry; mypy strict; update `tasks.md` checklist
+- [x] 6.1 RED: `model_unknown_sentinel_on_unselected`, `bounded_label_values`
+- [x] 6.2 RED: `span_error_status_with_error_type_attribute`
+- [x] 6.3 GREEN: create `observability/metrics.py` (span `chat.completion`, 3 metrics, `MODEL_UNKNOWN`)
+- [x] 6.4 GREEN: wire `ChatTelemetry` into `api/chat.py` routed call site
+- [x] 6.5 RED: `unexpected_error_records_error_metric_and_propagates`
+- [x] 6.6 GREEN: re-raise non-`LLMuxError` after error telemetry; mypy strict; update `tasks.md` checklist
 
 ## Guardrail Mapping
 
