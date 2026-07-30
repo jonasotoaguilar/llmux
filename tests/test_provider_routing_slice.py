@@ -1,10 +1,12 @@
-"""Provider routing functional slice — PR1 (config + errors)."""
+"""Provider routing functional slice — PR1 (config + errors) + PR2 (OpenAI adapter)."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from urllib.parse import quote
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -17,6 +19,13 @@ from llmux.core.errors import (
     UpstreamTimeoutError,
     to_openai_envelope,
 )
+from llmux.core.providers.base import (
+    CompletionResult,
+    HealthStatus,
+    ModelInfo,
+    ProviderAdapter,
+)
+from llmux.core.providers.openai import OpenAIAdapter
 
 _OPENAI_ENV = (
     "LLMUX_PROVIDERS_CONFIGURED",
@@ -163,3 +172,224 @@ def test_errors_envelope_unknown_subclass_uses_base_defaults() -> None:
     assert Custom().status_code == 500
     assert body["error"]["code"] == "internal_error"
     assert "should-not-leak" not in json.dumps(body)
+
+
+# ----- 2.1 / 2.2 / 2.3 — OpenAI adapter (httpx.MockTransport) -------------
+
+
+def _ok_payload(content: str = "hello") -> dict[str, object]:
+    """Canonical OpenAI non-streaming chat completion response."""
+    return {
+        "id": "chatcmpl-test",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+    }
+
+
+def _make_adapter(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("gpt-4o-mini",),
+    base_url: str = "https://api.openai.com/v1",
+) -> tuple[OpenAIAdapter, httpx.AsyncClient]:
+    """Build an adapter with a caller-owned ``MockTransport``-backed client.
+
+    The returned ``AsyncClient`` is caller-owned: the adapter never closes it,
+    the test does. This keeps the registry/a-clos contract tested in PR3.
+    """
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return (
+        OpenAIAdapter(
+            client=client,
+            api_key=SecretStr("sk-test-secret-1234"),
+            base_url=base_url,
+            models=models,
+            timeout_s=10.0,
+        ),
+        client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_satisfies_protocol() -> None:
+    """``OpenAIAdapter`` MUST satisfy the ``ProviderAdapter`` runtime Protocol."""
+    adapter, client = _make_adapter(lambda r: httpx.Response(200, json=_ok_payload()))
+    try:
+        assert isinstance(adapter, ProviderAdapter)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_complete_returns_result_with_expected_fields() -> None:
+    """``complete`` returns a ``CompletionResult`` with all five fields populated."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=_ok_payload("hi back"))
+
+    adapter, client = _make_adapter(handler)
+    try:
+        result = await adapter.complete(
+            "gpt-4o-mini", [{"role": "user", "content": "hello"}]
+        )
+    finally:
+        await client.aclose()
+    assert isinstance(result, CompletionResult)
+    assert result.content == "hi back"
+    assert result.model == "gpt-4o-mini"
+    assert result.finish_reason == "stop"
+    assert result.prompt_tokens == 5
+    assert result.completion_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_complete_sends_correct_request() -> None:
+    """``complete`` POSTs to ``/chat/completions`` with Bearer auth and a
+    well-shaped JSON body (``stream=False``, model, messages, options merged)."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=_ok_payload())
+
+    adapter, client = _make_adapter(handler, base_url="https://api.openai.com/v1")
+    try:
+        await adapter.complete(
+            "gpt-4o-mini",
+            [{"role": "user", "content": "ping"}],
+            options={"temperature": 0.0, "max_tokens": 16},
+        )
+    finally:
+        await client.aclose()
+    req = captured["request"]
+    assert str(req.url) == "https://api.openai.com/v1/chat/completions"
+    assert req.headers["Authorization"] == "Bearer sk-test-secret-1234"
+    assert req.headers["Content-Type"] == "application/json"
+    body = json.loads(req.content.decode("utf-8"))
+    assert body["model"] == "gpt-4o-mini"
+    assert body["stream"] is False
+    assert body["messages"] == [{"role": "user", "content": "ping"}]
+    assert body["temperature"] == 0.0 and body["max_tokens"] == 16
+
+
+def test_openai_complete_stream_raises_not_implemented() -> None:
+    """``complete_stream`` MUST raise ``NotImplementedError`` (sync, not awaited)."""
+    adapter, _client = _make_adapter(lambda r: httpx.Response(200, json=_ok_payload()))
+    with pytest.raises(NotImplementedError):
+        adapter.complete_stream("gpt-4o-mini", [{"role": "user", "content": "x"}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,expected",
+    [
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("boom", request=r)),
+            UpstreamError,
+            id="transport_error",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(400, json={"error": "bad model"}),
+            UpstreamError,
+            id="upstream_400",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(429, json={"error": "rate limit"}),
+            UpstreamError,
+            id="upstream_429",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(500, json={"error": "internal"}),
+            UpstreamError,
+            id="upstream_500",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(200, text="<html>not json</html>"),
+            UpstreamError,
+            id="malformed_body",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(200, json={"unexpected": "shape"}),
+            UpstreamError,
+            id="missing_choices",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(
+                200, json={"choices": [{"finish_reason": "stop"}]}
+            ),
+            UpstreamError,
+            id="missing_message",
+        ),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.TimeoutException("slow", request=r)),
+            UpstreamTimeoutError,
+            id="timeout",
+        ),
+    ],
+)
+async def test_openai_complete_maps_failures_to_typed_errors(
+    factory: Callable[[httpx.Request], httpx.Response],
+    expected: type[Exception],
+) -> None:
+    """Upstream HTTP/transport/parse failures MUST surface as typed
+    ``LLMuxError`` subclasses — never as bare ``httpx`` exceptions."""
+    adapter, client = _make_adapter(factory)
+    try:
+        with pytest.raises(expected):
+            await adapter.complete("gpt-4o-mini", [{"role": "user", "content": "x"}])
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_models_returns_configured_models() -> None:
+    """``models()`` returns one ``ModelInfo`` per configured model id,
+    stamped with ``provider='openai'`` and ``supports_streaming=False``."""
+    adapter, client = _make_adapter(
+        lambda r: httpx.Response(200, json={"data": []}),
+        models=("gpt-4o-mini", "gpt-4o"),
+    )
+    try:
+        models = await adapter.models()
+    finally:
+        await client.aclose()
+    assert tuple(m.id for m in models) == ("gpt-4o-mini", "gpt-4o")
+    assert all(isinstance(m, ModelInfo) and m.provider == "openai" for m in models)
+    assert all(m.supports_streaming is False for m in models)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,healthy",
+    [
+        pytest.param(lambda r: httpx.Response(200, json={"data": []}), True, id="2xx"),
+        pytest.param(
+            lambda r: httpx.Response(503, json={"error": "down"}), False, id="5xx"
+        ),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("nope", request=r)),
+            False,
+            id="transport",
+        ),
+    ],
+)
+async def test_openai_health_reflects_outcome(
+    factory: Callable[[httpx.Request], httpx.Response], healthy: bool
+) -> None:
+    """``health()`` reports healthy iff ``GET /models`` is 2xx; transport
+    errors are caught and reported as unhealthy (no raise)."""
+    adapter, client = _make_adapter(factory)
+    try:
+        h = await adapter.health()
+    finally:
+        await client.aclose()
+    assert isinstance(h, HealthStatus) and h.healthy is healthy

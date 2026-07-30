@@ -31,9 +31,9 @@ Chain strategy: feature-branch-chain
 
 ## PR2 — OpenAI Adapter (base PR1)
 
-- [ ] 2.1 RED: `complete_returns_result`, `complete_stream_raises_not_implemented`
-- [ ] 2.2 RED: `upstream_4xx_5xx→upstream_error`, `timeout→upstream_timeout`
-- [ ] 2.3 GREEN: create `core/providers/openai.py` (Protocol, injected `httpx.AsyncClient`)
+- [x] 2.1 RED: `complete_returns_result`, `complete_stream_raises_not_implemented`
+- [x] 2.2 RED: `upstream_4xx_5xx→upstream_error`, `timeout→upstream_timeout`
+- [x] 2.3 GREEN: create `core/providers/openai.py` (Protocol, injected `httpx.AsyncClient`)
 
 ## PR3 — Registry + Partial-Construction Cleanup (base PR2)
 
