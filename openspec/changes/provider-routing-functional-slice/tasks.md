@@ -52,11 +52,11 @@ Chain strategy: feature-branch-chain
 
 ## PR5 — Chat Routing + Envelopes, no telemetry (base PR4)
 
-- [ ] 5.1 RED: `stream_false_routes_200`, `omitted_stream_defaults_false_routes`
-- [ ] 5.2 RED: `stream_true_501_no_provider_no_telemetry` (no `data:` frames)
-- [ ] 5.3 GREEN: short-circuit explicit `stream=True` → JSON 501 (before provider/telemetry)
-- [ ] 5.4 RED: `chat_{400_selection_miss,502_upstream,504_timeout,502_sanitized}`
-- [ ] 5.5 GREEN: modify `api/chat.py` to route when `stream is False` (incl. omitted)
+- [x] 5.1 RED: `stream_false_routes_200`, `omitted_stream_defaults_false_routes`
+- [x] 5.2 RED: `stream_true_501_no_provider_no_telemetry` (no `data:` frames)
+- [x] 5.3 GREEN: short-circuit explicit `stream=True` → JSON 501 (before provider/telemetry)
+- [x] 5.4 RED: `chat_{400_selection_miss,502_upstream,504_timeout,502_sanitized}`
+- [x] 5.5 GREEN: modify `api/chat.py` to route when `stream is False` (incl. omitted)
 
 ## PR6 — OTel + Metrics + Cardinality + Error Accounting (base PR5)
 
