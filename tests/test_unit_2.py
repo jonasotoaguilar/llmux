@@ -72,10 +72,13 @@ def test_settings_providers_accepts_json_and_empty(
 ) -> None:
     # OPENAI_API_KEY + OPENAI_MODELS are required when 'openai' is in
     # LLMUX_PROVIDERS_CONFIGURED; the fail-fast ConfigurationError is
-    # exercised separately in test_provider_routing_slice.
+    # exercised separately in test_provider_routing_slice. The same
+    # contract applies to Anthropic (anthropic-provider-adapter-slice / PR1).
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", '["openai","anthropic"]')
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-123")
     monkeypatch.setenv("OPENAI_MODELS", "gpt-4o-mini")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-ant-key-123")
+    monkeypatch.setenv("ANTHROPIC_MODELS", "claude-3-5-sonnet-20240620")
     assert Settings().llmux_providers_configured == ["openai", "anthropic"]  # type: ignore[call-arg]
     monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "")
     assert Settings().llmux_providers_configured == []  # type: ignore[call-arg]

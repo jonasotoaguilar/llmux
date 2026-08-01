@@ -58,11 +58,20 @@ _OPENAI_ENV = (
     "OPENAI_MODELS",
     "OPENAI_TIMEOUT_S",
 )
+_ANTHROPIC_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_VERSION",
+    "ANTHROPIC_MODELS",
+    "ANTHROPIC_TIMEOUT_S",
+)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in _OPENAI_ENV:
+        monkeypatch.delenv(var, raising=False)
+    for var in _ANTHROPIC_ENV:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -419,6 +428,94 @@ async def test_openai_health_reflects_outcome(
     assert isinstance(h, HealthStatus) and h.healthy is healthy
 
 
+# ----- 1.1 / 1.2 — Anthropic settings (valid + fail-fast ConfigurationError) --
+
+
+def _enable_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: str | None = "sk-ant-test",
+    base_url: str = "https://api.anthropic.com",
+    models: str = "claude-3-5-sonnet-20240620",
+) -> None:
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    if api_key is not None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.setenv("ANTHROPIC_MODELS", models)
+
+
+def test_anthropic_settings_valid_parses_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic settings MUST parse all four env-bound fields when enabled."""
+    _enable_anthropic(
+        monkeypatch,
+        api_key="sk-ant-abc",
+        base_url="https://api.anthropic.com",
+        models='["claude-3-5-sonnet-20240620","claude-3-haiku-20240307"]',
+    )
+    monkeypatch.setenv("ANTHROPIC_VERSION", "2023-06-01")
+    monkeypatch.setenv("ANTHROPIC_TIMEOUT_S", "12.5")
+    s = Settings()  # type: ignore[call-arg]
+    assert isinstance(s.anthropic_api_key, SecretStr)
+    assert s.anthropic_api_key.get_secret_value() == "sk-ant-abc"
+    assert s.anthropic_base_url == "https://api.anthropic.com"
+    assert s.anthropic_version == "2023-06-01"
+    assert s.anthropic_models == [
+        "claude-3-5-sonnet-20240620",
+        "claude-3-haiku-20240307",
+    ]
+    assert s.anthropic_timeout_s == 12.5
+
+
+def test_anthropic_settings_default_when_no_provider_configured() -> None:
+    """With no Anthropic provider configured, fields stay at safe defaults and
+    the validator is a no-op (matches the OpenAI default-when-disabled path)."""
+    s = Settings()  # type: ignore[call-arg]
+    assert s.anthropic_api_key is None
+    assert s.anthropic_models == []
+    assert s.anthropic_base_url == "https://api.anthropic.com"
+    assert s.anthropic_version == "2023-06-01"
+    assert s.anthropic_timeout_s == 30.0
+
+
+@pytest.mark.parametrize(
+    "api_key,base_url,models,expected",
+    [
+        (
+            "",
+            "https://api.anthropic.com",
+            "claude-3-5-sonnet-20240620",
+            "ANTHROPIC_API_KEY",
+        ),
+        ("sk-ant-abc", "https://api.anthropic.com", "", "ANTHROPIC_MODELS"),
+        (
+            "sk-ant-abc",
+            "not-a-url",
+            "claude-3-5-sonnet-20240620",
+            "ANTHROPIC_BASE_URL",
+        ),
+    ],
+    ids=["empty_key", "empty_models", "invalid_url"],
+)
+def test_anthropic_settings_invalid_raises_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+    base_url: str,
+    models: str,
+    expected: str,
+) -> None:
+    """Empty key, empty model list, or invalid base URL MUST fail fast with a
+    ``ConfigurationError`` mirroring the OpenAI contract."""
+    _enable_anthropic(monkeypatch, api_key=api_key, base_url=base_url, models=models)
+    with pytest.raises(ConfigurationError) as exc:
+        Settings()  # type: ignore[call-arg]
+    assert expected in str(exc.value)
+    # The error details MUST carry the provider slug for ops/observability.
+    assert exc.value.details.get("provider") == "anthropic"
+
+
 # ----- 3.1 / 3.2 / 3.3 — ProviderRegistry + build_providers -----------------
 
 
@@ -467,12 +564,18 @@ async def test_build_providers_closes_first_client_on_later_failure(
     """Deterministic factory seam: 1st provider builds, 2nd is unknown.
     The injected factory is called once; the 1st client MUST be closed
     exactly once (no double-close, no leak) before ConfigurationError.
+
+    The 2nd slug is a truly-unknown one (``fake-unknown-slug``) so the
+    mid-build cleanup invariant is still proven after the ``anthropic``
+    slug becomes a valid configured provider in
+    ``anthropic-provider-adapter-slice`` (PR2 adds the dispatch; PR1
+    only adds the Settings contract).
     """
     clients: list[_CountingClient] = []
-    settings = _settings(monkeypatch, providers="openai,anthropic")
+    settings = _settings(monkeypatch, providers="openai,fake-unknown-slug")
     with pytest.raises(ConfigurationError) as exc:
         await build_providers(settings, client_factory=_counting_factory(clients))
-    assert "anthropic" in str(exc.value)
+    assert "fake-unknown-slug" in str(exc.value)
     assert len(clients) == 1
     assert clients[0].is_closed and clients[0].aclose_count == 1
 
