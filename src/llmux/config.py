@@ -61,6 +61,25 @@ class Settings(BaseSettings):
         float, Field(alias="OPENAI_TIMEOUT_S", default=30.0, gt=0.0)
     ]
 
+    # Anthropic provider settings (anthropic-provider-adapter-slice / PR1).
+    # Same fail-fast contract as openai: empty key, empty model list, or a
+    # non-http(s) base URL raises ``ConfigurationError`` at construction time.
+    anthropic_api_key: Annotated[
+        SecretStr | None, Field(alias="ANTHROPIC_API_KEY", default=None)
+    ]
+    anthropic_base_url: Annotated[
+        str, Field(alias="ANTHROPIC_BASE_URL", default="https://api.anthropic.com")
+    ]
+    anthropic_version: Annotated[
+        str, Field(alias="ANTHROPIC_VERSION", default="2023-06-01")
+    ]
+    anthropic_models: Annotated[
+        list[str], NoDecode, Field(alias="ANTHROPIC_MODELS", default_factory=list)
+    ]
+    anthropic_timeout_s: Annotated[
+        float, Field(alias="ANTHROPIC_TIMEOUT_S", default=30.0, gt=0.0)
+    ]
+
     @field_validator("llmux_providers_configured", mode="before")
     @classmethod
     def _parse_providers(cls, value: object) -> list[str]:
@@ -69,6 +88,11 @@ class Settings(BaseSettings):
     @field_validator("openai_models", mode="before")
     @classmethod
     def _parse_openai_models(cls, value: object) -> list[str]:
+        return _parse_str_list(value)
+
+    @field_validator("anthropic_models", mode="before")
+    @classmethod
+    def _parse_anthropic_models(cls, value: object) -> list[str]:
         return _parse_str_list(value)
 
     @model_validator(mode="after")
@@ -97,5 +121,35 @@ class Settings(BaseSettings):
                 "OPENAI_BASE_URL must be an http(s) URL with a host",
                 invalid_field="OPENAI_BASE_URL",
                 provider="openai",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_anthropic_when_enabled(self) -> Settings:
+        """Fail-fast ``ConfigurationError`` when anthropic is mis-configured."""
+        if "anthropic" not in self.llmux_providers_configured:
+            return self
+        key_value = (
+            self.anthropic_api_key.get_secret_value() if self.anthropic_api_key else ""
+        )
+        if not key_value:
+            raise ConfigurationError(
+                "ANTHROPIC_API_KEY is required when 'anthropic' is enabled",
+                missing_key="ANTHROPIC_API_KEY",
+                provider="anthropic",
+            )
+        if not self.anthropic_models:
+            raise ConfigurationError(
+                "ANTHROPIC_MODELS must list at least one model "
+                "when 'anthropic' is enabled",
+                missing_field="ANTHROPIC_MODELS",
+                provider="anthropic",
+            )
+        parsed = urlparse(self.anthropic_base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ConfigurationError(
+                "ANTHROPIC_BASE_URL must be an http(s) URL with a host",
+                invalid_field="ANTHROPIC_BASE_URL",
+                provider="anthropic",
             )
         return self
