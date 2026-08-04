@@ -6,6 +6,11 @@ transaction-like cleanup of :func:`build_providers` when a later provider
 fails to construct. Adapters constructed with a caller-supplied client (e.g.
 ``MockTransport`` in tests) are recorded as ``client=None`` so the registry
 never re-closes them.
+
+Both supported slugs dispatch to their adapter constructor through the
+``_build_openai`` / ``_build_anthropic`` helpers; every factory-created
+client is appended to ``created_clients`` so one cleanup path serves all
+providers.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import httpx
 
 from llmux.config import Settings
 from llmux.core.errors import ConfigurationError
+from llmux.core.providers.anthropic import AnthropicAdapter
 from llmux.core.providers.base import ModelInfo, ProviderAdapter
 from llmux.core.providers.openai import OpenAIAdapter
 
@@ -77,6 +83,64 @@ def _default_client_factory() -> httpx.AsyncClient:
     return httpx.AsyncClient()
 
 
+def _build_openai(
+    settings: Settings,
+    client_factory: ClientFactory,
+    created_clients: list[httpx.AsyncClient],
+) -> RegistryEntry:
+    """Construct the OpenAI entry for ``build_providers``.
+
+    The factory-created client is appended to ``created_clients`` so the
+    transaction-like cleanup closes it exactly once if a later provider
+    fails to construct. The entry records the client as registry-owned.
+    """
+    if settings.openai_api_key is None:
+        raise ConfigurationError(
+            "OPENAI_API_KEY is required when 'openai' is enabled",
+            missing_key="OPENAI_API_KEY",
+            provider="openai",
+        )
+    client = client_factory()
+    created_clients.append(client)
+    adapter = OpenAIAdapter(
+        client=client,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        models=tuple(settings.openai_models),
+        timeout_s=settings.openai_timeout_s,
+    )
+    return RegistryEntry(adapter=adapter, client=client)
+
+
+def _build_anthropic(
+    settings: Settings,
+    client_factory: ClientFactory,
+    created_clients: list[httpx.AsyncClient],
+) -> RegistryEntry:
+    """Construct the Anthropic entry for ``build_providers``.
+
+    Mirrors ``_build_openai``: the fail-fast key check, the factory-created
+    registry-owned client, and the ``ANTHROPIC_*`` settings wiring.
+    """
+    if settings.anthropic_api_key is None:
+        raise ConfigurationError(
+            "ANTHROPIC_API_KEY is required when 'anthropic' is enabled",
+            missing_key="ANTHROPIC_API_KEY",
+            provider="anthropic",
+        )
+    client = client_factory()
+    created_clients.append(client)
+    adapter = AnthropicAdapter(
+        client=client,
+        api_key=settings.anthropic_api_key,
+        base_url=settings.anthropic_base_url,
+        version=settings.anthropic_version,
+        models=tuple(settings.anthropic_models),
+        timeout_s=settings.anthropic_timeout_s,
+    )
+    return RegistryEntry(adapter=adapter, client=client)
+
+
 async def build_providers(
     settings: Settings,
     *,
@@ -102,27 +166,17 @@ async def build_providers(
                     slug=slug,
                 )
             seen.add(slug)
-            if slug != "openai":
+            if slug == "openai":
+                entries.append(_build_openai(settings, client_factory, created_clients))
+            elif slug == "anthropic":
+                entries.append(
+                    _build_anthropic(settings, client_factory, created_clients)
+                )
+            else:
                 raise ConfigurationError(
                     f"Unknown provider '{slug}'",
                     slug=slug,
                 )
-            if settings.openai_api_key is None:
-                raise ConfigurationError(
-                    "OPENAI_API_KEY is required when 'openai' is enabled",
-                    missing_key="OPENAI_API_KEY",
-                    provider="openai",
-                )
-            client = client_factory()
-            created_clients.append(client)
-            adapter = OpenAIAdapter(
-                client=client,
-                api_key=settings.openai_api_key,
-                base_url=settings.openai_base_url,
-                models=tuple(settings.openai_models),
-                timeout_s=settings.openai_timeout_s,
-            )
-            entries.append(RegistryEntry(adapter=adapter, client=client))
     except BaseException:
         for client in created_clients:
             with suppress(Exception):

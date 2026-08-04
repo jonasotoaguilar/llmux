@@ -90,6 +90,19 @@ def _enable(
     monkeypatch.setenv("OPENAI_MODELS", models)
 
 
+def _anthropic_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: str = "sk-ant-test-secret-1234",
+    base_url: str = "https://api.anthropic.com",
+    models: str = "claude-3-5-sonnet-20240620",
+) -> None:
+    """Set the ``ANTHROPIC_*`` env vars for ``Settings`` construction."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.setenv("ANTHROPIC_MODELS", models)
+
+
 # ----- 1.1 / 1.2 — OpenAI settings (valid + fail-fast ConfigurationError) --
 
 
@@ -1180,6 +1193,33 @@ async def test_aclose_idempotent_after_success(
 
 
 @pytest.mark.asyncio
+async def test_aclose_skips_caller_owned_anthropic_test_client() -> None:
+    """An Anthropic ``MockTransport`` client injected into the registry is
+    caller-owned (``RegistryEntry(client=None)``); the registry MUST NOT
+    re-close it, so after ``aclose()`` the injected client's ``aclose_count``
+    stays at exactly one — the caller's own close.
+
+    Spec: 'Injected Anthropic test client is not double-closed'."""
+    injected = _CountingClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    adapter = AnthropicAdapter(
+        client=injected,
+        api_key=SecretStr("sk-ant-test-secret-1234"),
+        base_url="https://api.anthropic.com",
+        version="2023-06-01",
+        models=("claude-3-5-sonnet-20240620",),
+        timeout_s=10.0,
+    )
+    registry = ProviderRegistry((RegistryEntry(adapter, client=None),))
+    await registry.aclose()
+    await registry.aclose()  # idempotent; still skips caller-owned entries
+    assert not injected.is_closed and injected.aclose_count == 0
+    await injected.aclose()  # the caller owns exactly one close
+    assert injected.is_closed and injected.aclose_count == 1
+
+
+@pytest.mark.asyncio
 async def test_registry_models_aggregates_across_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1218,6 +1258,45 @@ async def test_build_providers_default_factory_creates_and_closes_real_client(
     assert real_client.is_closed
     await registry.aclose()
     await registry.aclose()
+
+
+# 4.1/4.2 RED — anthropic slug dispatch + registry-owned client --------------
+
+
+@pytest.mark.asyncio
+async def test_build_providers_dispatches_anthropic_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``anthropic`` slug MUST dispatch to :class:`AnthropicAdapter` and
+    register it alongside any OpenAI adapter in configured order; the
+    factory-created Anthropic client is registry-owned and closed exactly
+    once by ``aclose()``.
+
+    Spec: 'The anthropic slug dispatches to the Anthropic adapter' +
+    'Ordered Provider Registry And Lifecycle' (registry-owned clients)."""
+    _anthropic_env(monkeypatch)
+    settings = _settings(monkeypatch, providers="openai,anthropic")
+    clients: list[_CountingClient] = []
+    registry = await build_providers(
+        settings, client_factory=_counting_factory(clients)
+    )
+    try:
+        providers = registry.providers
+        assert len(providers) == 2
+        assert isinstance(providers[0], OpenAIAdapter)
+        assert isinstance(providers[1], AnthropicAdapter)
+        assert providers[1].name == "anthropic"
+        models = await registry.models()
+        assert tuple(m.id for m in models) == (
+            "gpt-4o-mini",
+            "claude-3-5-sonnet-20240620",
+        )
+        assert models[1].provider == "anthropic"
+    finally:
+        await registry.aclose()
+    # Both factory-created clients are registry-owned: closed exactly once.
+    assert len(clients) == 2
+    assert all(c.is_closed and c.aclose_count == 1 for c in clients)
 
 
 # ----- 4.1 / 4.2 — Async first-match select_provider ------------------------
