@@ -1815,6 +1815,316 @@ async def test_chat_504_on_upstream_timeout(
         await client.aclose()
 
 
+def _make_anthropic_adapter_holder(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("claude-3-5-sonnet-20240620",),
+    base_url: str = "https://api.anthropic.com",
+) -> tuple[AnthropicAdapter, httpx.AsyncClient]:
+    """Live-ASGI holder: an :class:`AnthropicAdapter` with a caller-owned
+    ``MockTransport`` client, ready for ``RegistryEntry(adapter, None)`` —
+    the caller-owned marker the registry MUST NOT re-close."""
+    return _make_anthropic_adapter(handler, models=models, base_url=base_url)
+
+
+def _post_anthropic_chat(client: TestClient, **overrides: object) -> httpx.Response:
+    """POST a chat request for the canonical Anthropic model."""
+    body: dict[str, object] = {"model": "claude-3-5-sonnet-20240620"}
+    body.update(overrides)
+    return _post_chat(client, **body)
+
+
+# 4.4/4.5 RED — chat max_tokens allowlist forwarding --------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_forwards_max_tokens_to_anthropic_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max_tokens`` on the public surface MUST pass the allowlist and
+    reach the Anthropic wire as a caller override."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, max_tokens=512)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 512
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_drops_unknown_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown request extras (e.g. ``temperature``, ``top_p``) MUST NOT be
+    forwarded to any provider — the allowlist admits only ``max_tokens``."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, max_tokens=512, temperature=0.7)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 512
+        assert "temperature" not in sent
+        assert "stream" not in sent  # the Anthropic wire has no stream field
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_max_tokens_omitted_passes_no_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``max_tokens`` MUST pass no override, so the Anthropic
+    adapter applies its own ``1024`` default on the wire."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 1024
+    finally:
+        await client.aclose()
+
+
+def _counting_mock_factory(
+    handler: Callable[[httpx.Request], httpx.Response],
+    sink: list[_CountingClient],
+) -> ClientFactory:
+    """ClientFactory yielding ``_CountingClient``s backed by the given
+    ``MockTransport`` handler — production-shape clients whose wire calls
+    stay in-process and whose closes are countable."""
+
+    def factory() -> httpx.AsyncClient:
+        client = _CountingClient(transport=httpx.MockTransport(handler))
+        sink.append(client)
+        return client
+
+    return factory
+
+
+def _app_with_real_registry(
+    monkeypatch: pytest.MonkeyPatch, client_factory: ClientFactory
+) -> FastAPI:
+    """Build ``create_app()`` whose lifespan runs the REAL ``build_providers``
+    with an injected client factory against env-driven ``Settings`` — the
+    production construction path (settings → registry → lifespan → routing),
+    in-process. Unlike ``_patch_lifespan``, nothing about the registry or
+    tracing is faked."""
+    import llmux.main as main_mod
+    from llmux.core.providers import registry as registry_mod
+
+    real_build_providers = registry_mod.build_providers
+
+    async def build_with_factory(settings: Settings) -> ProviderRegistry:
+        return await real_build_providers(settings, client_factory=client_factory)
+
+    monkeypatch.setattr(main_mod, "build_providers", build_with_factory)
+    return create_app()
+
+
+# 4.8 RED — live ASGI coverage for the Anthropic chat path --------------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_returns_200_openai_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured Anthropic model routes through the unchanged chat path
+    and returns 200 with the gateway's normalized completion envelope
+    (``object``/``created`` injected over the Anthropic raw payload)."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        body = response.json()
+        assert body["object"] == "chat.completion"
+        assert body["created"] == 0
+        assert body["id"] == "msg_test"
+        assert body["model"] == "claude-3-5-sonnet-20240620"
+        assert body["usage"]["input_tokens"] == 8
+        assert body["usage"]["output_tokens"] == 4
+        assert len(captured) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_400_selection_miss_no_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model no provider offers MUST map to 400 ``model_not_found`` with
+    no upstream invocation and no leak of the requested model id."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json=_anthropic_ok_payload("never reached"))
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, model="claude-unknown-LEAK")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "model_not_found"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "claude-unknown-LEAK" not in json.dumps(body)
+        assert call_count["n"] == 0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_502_upstream_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic HTTP failure → 502 ``upstream_error``; the envelope MUST
+    not leak the upstream body, key, or a stack trace."""
+    secret_key = "sk-ant-LEAK-1234"
+    secret_body = "anthropic-internal-error-LEAK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": secret_body, "key": secret_key})
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"]["code"] == "upstream_error"
+        serialized = json.dumps(body)
+        for token in (secret_key, secret_body, "Traceback", "File '"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_504_timeout_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic timeout → 504 ``upstream_timeout`` with a sanitized
+    envelope (timeout subclass maps to 504 per the stable code map)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("slow", request=request)
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 504
+        body = response.json()
+        assert body["error"]["code"] == "upstream_timeout"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_stream_true_501_no_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``stream=true`` MUST short-circuit to a JSON 501 with no
+    Anthropic invocation — the strongest evidence is the handler count."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json=_anthropic_ok_payload("never reached"))
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, stream=True)
+        assert response.status_code == 501
+        assert response.headers["content-type"].startswith("application/json")
+        assert "data:" not in response.text
+        assert call_count["n"] == 0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_max_tokens_512_on_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production path (env Settings → real ``build_providers`` → lifespan →
+    routing): a caller-supplied ``max_tokens=512`` reaches the Anthropic
+    wire, and the factory-created client is registry-owned and closed
+    exactly once at shutdown."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    with TestClient(app) as tc:
+        response = _post_anthropic_chat(tc, max_tokens=512)
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured["request"].content.decode("utf-8"))
+    assert sent["max_tokens"] == 512
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_omitted_max_tokens_1024_on_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production path: omitting ``max_tokens`` passes no override, so the
+    Anthropic adapter's ``1024`` default reaches the wire."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    with TestClient(app) as tc:
+        response = _post_anthropic_chat(tc)
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured["request"].content.decode("utf-8"))
+    assert sent["max_tokens"] == 1024
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
 # ----- 6.1 / 6.2 / 6.5 — PR6 telemetry: span + 3 metrics + sentinel + error --
 
 

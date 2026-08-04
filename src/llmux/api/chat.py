@@ -6,7 +6,10 @@ completion envelope, or one of the documented error envelopes
 (``400 ProviderSelectionError`` / ``502 ConfigurationError`` /
 ``502 UpstreamError`` / ``504 UpstreamTimeoutError``). An explicit
 ``stream=true`` short-circuits to a JSON 501 *before* any provider call
-or telemetry work, preserving the no-fake-SSE contract.
+or telemetry work, preserving the no-fake-SSE contract. The public
+``max_tokens`` field is forwarded to the selected adapter through a
+fixed allowlist (:func:`_allowlist_options`); all other arbitrary
+request extras are accepted by Pydantic but never reach a provider.
 
 Each non-streaming hop is wrapped in a :class:`ChatCompletionTimer` that
 records one ``chat.completion`` span and three bounded-cardinality
@@ -62,6 +65,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str
     messages: Annotated[list[ChatMessage], Field(min_length=1)]
+    max_tokens: Annotated[int | None, Field(default=None, ge=1)]
     stream: bool = False
 
 
@@ -86,6 +90,21 @@ def _error_response(error: LLMuxError) -> JSONResponse:
         content=to_openai_envelope(error),
         media_type="application/json",
     )
+
+
+def _allowlist_options(body: ChatCompletionRequest) -> dict[str, int]:
+    """Return the admitted provider options for a chat request.
+
+    The allowlist is the single forwarding contract between the public
+    surface and the adapters: today only ``max_tokens`` is admitted.
+    Unknown request extras remain accepted by Pydantic but are NEVER
+    forwarded; omitting ``max_tokens`` passes no override, so the
+    selected adapter applies its own default (``1024`` for Anthropic).
+    """
+    options: dict[str, int] = {}
+    if body.max_tokens is not None:
+        options["max_tokens"] = body.max_tokens
+    return options
 
 
 @chat_router.post("/chat/completions")
@@ -161,6 +180,7 @@ async def post_chat_completion(
             result = await adapter.complete(
                 body.model,
                 [m.model_dump(exclude_none=True) for m in body.messages],
+                options=_allowlist_options(body),
             )
         except LLMuxError as exc:
             timer.set_error_type(type(exc).error_type)
