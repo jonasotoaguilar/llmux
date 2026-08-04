@@ -22,8 +22,8 @@ Chain strategy: feature-branch-chain
 
 ## Phase 0 — Issue-First Gate
 
-- [ ] 0.1 Open GH feature request #20; link `proposal.md`; wait for `status:approved`.
-- [ ] 0.2 All four PRs stay draft until #20 is approved.
+- [x] 0.1 Open GH feature request #20; link `proposal.md`; wait for `status:approved` — #20 open with `status:approved`.
+- [x] 0.2 All PRs stay draft until #20 is approved — approved; children remain draft per chain policy.
 
 ## Phase 1 — PR1: Settings + .env (≈ 140 LoC, base = main)
 
