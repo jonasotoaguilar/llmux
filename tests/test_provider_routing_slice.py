@@ -2273,8 +2273,8 @@ async def test_telemetry_model_unknown_sentinel_on_unselected(
 @pytest.mark.asyncio
 async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every label value on every emitted metric MUST be drawn from a
-    fixed, bounded set. The set of providers comes from the
-    configured adapters (``openai``) plus the :data:`PROVIDER_NONE`
+    fixed, bounded set. The set of providers comes from the configured
+    adapters (``openai``, ``anthropic``) plus the :data:`PROVIDER_NONE`
     sentinel; the set of models comes from the configured model list
     plus :data:`MODEL_UNKNOWN`; ``outcome`` is in {success, error};
     ``error.type`` is in the class-level set of LLMuxError error
@@ -2292,7 +2292,7 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
             app.state.telemetry = telemetry
             # Force a selection miss with a free-form model id.
             _post_chat(tc, model="some-arbitrary-unknown-model")
-        bounded_providers = {"openai", "none"}
+        bounded_providers = {"openai", "anthropic", "none"}
         bounded_models = {"gpt-4o-mini", "unknown"}
         bounded_outcomes = {"success", "error"}
         bounded_error_types = {
@@ -2323,6 +2323,73 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
                     )
     finally:
         await client.aclose()
+
+
+# 4.10/4.11 RED — bounded anthropic provider label ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_bounded_anthropic_provider_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed Anthropic hop MUST record the bounded ``provider="anthropic"``
+    label on the span and every metric — a new member of the existing
+    bounded set — with no new metric name or label dimension.
+
+    Spec: 'Anthropic hop records the bounded provider label' + 'Bounded
+    Telemetry Conformance'. Runs on the production construction path so
+    the label is observed on a real dispatched registry, not a stub."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    with TestClient(app) as tc:
+        app.state.telemetry = telemetry
+        response = _post_anthropic_chat(tc)
+    assert response.status_code == 200, response.text
+    # Exactly one chat span with provider="anthropic" and the canonical
+    # result model (bounded set members only).
+    spans = _chat_spans(span_exporter)
+    assert len(spans) == 1
+    attrs = _span_attrs(spans[0])
+    assert attrs.get("provider") == "anthropic"
+    assert attrs.get("model") == "claude-3-5-sonnet-20240620"
+    assert attrs.get("outcome") == "success"
+    assert attrs.get("error.type") == "none"
+    # No new metric name and no label dimension outside the existing
+    # contract; every data point carries the anthropic provider label.
+    bounded_dimensions = {"provider", "model", "outcome", "error.type"}
+    known_metric_names = {
+        "chat_completion_requests_total",
+        "chat_completion_errors_total",
+        "chat_completion_duration_seconds",
+    }
+    data = metric_reader.get_metrics_data()
+    assert data is not None
+    seen_names: set[str] = set()
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for m in sm.metrics:
+                seen_names.add(m.name)
+                assert m.name in known_metric_names, f"new metric {m.name!r}"
+                for dp in m.data.data_points:
+                    dp_attrs = {
+                        str(k): (str(v) if v is not None else "")
+                        for k, v in (dp.attributes or {}).items()
+                    }
+                    assert set(dp_attrs) <= bounded_dimensions, (
+                        f"{m.name} leaked dimension "
+                        f"{set(dp_attrs) - bounded_dimensions}"
+                    )
+                    assert dp_attrs.get("provider") == "anthropic"
+    assert seen_names <= known_metric_names
+    assert "chat_completion_requests_total" in seen_names
+    assert "chat_completion_duration_seconds" in seen_names
 
 
 # 6.2 RED — span error status with error.type attribute ---------------------
