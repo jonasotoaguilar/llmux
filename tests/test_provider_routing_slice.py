@@ -2306,7 +2306,9 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
             "chat_completion_errors_total",
             "chat_completion_duration_seconds",
         ):
-            for point in _metric_data_points(metric_reader, name):
+            points = _metric_data_points(metric_reader, name)
+            assert points, f"metric {name} was not recorded"
+            for point in points:
                 attrs = point["attrs"]
                 assert attrs.get("provider") in bounded_providers, (
                     f"{name} provider label {attrs.get('provider')!r} not bounded"
@@ -2621,10 +2623,9 @@ async def test_telemetry_chat_span_and_three_metrics_on_success(
         # instrument is exposed), but no data point is emitted until
         # an actual error path increments the counter.
         errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
-        for p in errors:
-            assert p["attrs"].get("outcome") != "error", (
-                "errors_total must not be incremented on success"
-            )
+        assert errors == [], (
+            "errors_total must not emit a data point on the success path"
+        )
     finally:
         await client.aclose()
 
