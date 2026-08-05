@@ -82,3 +82,58 @@ Chain strategy: feature-branch-chain
 - [x] 4.13 **Tracker + chain delivered**: tracker **#22** (draft, base=main, `Closes #20`); PR2 **#23** → tracker, PR3 **#24** → #23, PR4 **#25** → #24, PR5 **#26** → #25, PR6 **#27** → #26; all drafts with `Related to #20` + `type:feature`. Children authored: #23 399, #24 399, #25 167, #26 332, #27 73 — all ≤ 400, no `size:exception`. PR Validation + Lint/Types/Tests green on #23-#26 (#27 last check pending at delivery). Tracker #22 remains draft/no-merge; its cumulative diff (969) exceeds 400 by design (aggregator) — `size:exception` intentionally not applied; maintainer decides at integration.
 
 > **Threat matrix**: only "Runtime provider routing" applies (covered by 4.8); other rows `N/A` per `design.md`. No `ARCHITECTURE.md`, no new ADR, no new dep. Out of scope: streaming/SSE, tool use, prompt caching, multimodal, model alias, cost, auth-validity health, fallback, retries, new error class, new metric.
+
+## Strict-TDD Cycle Evidence
+
+The implementation phases followed RED → GREEN → triangulation with the
+previous suite retained as the safety net. `N/A` denotes a bookkeeping,
+documentation, refactor, or verification task rather than a new behavior
+cycle. The phase reports and command results are also preserved in the
+Engram apply-progress artifact.
+
+| Task | RED | GREEN | TRIANGULATE | SAFETY NET |
+|------|-----|-------|-------------|------------|
+| 0.1 | N/A — issue gate | Issue #20 approved | GitHub issue labels/state | No code changed |
+| 0.2 | N/A — delivery gate | Children #23–#27 draft; #21 merged after approval | PR metadata and bases | No code changed |
+| 1.1 | Settings cases failed before validator | Focused settings cases passed | Empty key, empty models, invalid URL | Existing suite |
+| 1.2 | 1.1 RED cases | Same focused command passed | Default and enabled-provider paths | Existing suite |
+| 1.3 | N/A — environment documentation | `.env.example` block present | Settings names match config fields | Full PR1 suite |
+| 1.4 | N/A — fixture wiring | Anthropic fixture paths passed | Clean-env isolation | Full PR1 suite |
+| 1.5 | Two causal pre-existing tests failed after validation change | 86-test PR1 suite passed | JSON/empty settings and unknown-slug failure | Coverage gate |
+| 1.6 | N/A — verification task | 86 passed, 98.05% coverage | Ruff and mypy passed | PR1 suite and coverage gate |
+| 2.1 | Protocol/stream tests failed against stubs | Protocol and stream tests passed | Runtime-checkable Protocol surface | PR1 suite |
+| 2.2 | 2.1 RED cases | Adapter class tests passed | Constructor and four-method surface | PR1 suite |
+| 2.3 | Five request-shape cases failed | Five request tests passed | Headers, system join, role rejection, token default/override | PR1 suite |
+| 2.4 | 2.3 RED cases | Request-construction tests passed | Captured wire request assertions | PR1 suite |
+| 2.5 | Three typed-error cases failed | Three error cases passed | Transport, HTTP 500, timeout | PR1 suite |
+| 2.6 | 2.5 RED cases | Error normalization passed | Body discard and typed hierarchy | PR1 suite |
+| 2.7 | N/A — refactor | Anthropic focused suite passed | Helpers preserved request behavior | PR1 + PR2 suite |
+| 2.8 | N/A — verification task | 96 passed, 96.29% coverage | Ruff and mypy passed | PR1 + PR2 suite |
+| 3.1 | Five response cases failed against 2xx stub | Seven response tests passed | Text, non-text, tokens, three stop reasons | 96-test suite |
+| 3.2 | 3.1 RED cases | Parser and mapping tests passed | Malformed and missing-content cases | 96-test suite |
+| 3.3 | Models test failed against stub | Configured-model test passed | ModelInfo fields and provider label | 96-test suite |
+| 3.4 | 3.3 RED case | Models implementation passed | Multiple configured models | 96-test suite |
+| 3.5 | Two health cases failed against stub | Two health cases passed | Reachability success and transport failure | 96-test suite |
+| 3.6 | 3.5 RED cases | Health implementation passed | No-auth reachability behavior | 96-test suite |
+| 3.7 | N/A — verification task | 109 passed, 95.56% coverage | Ruff, format, and mypy passed | PR1–PR3 suite |
+| 4.1 | Anthropic slug dispatch failed as unknown | Dispatch test passed | Registry factory selection | 109-test suite |
+| 4.2 | 4.1 RED case | Registry construction passed | Factory cleanup and ownership marker | 109-test suite |
+| 4.3 | N/A — refactor | Registry suite passed | OpenAI behavior retained | 109-test suite |
+| 4.4 | Two allowlist cases failed | Allowlist focused suite passed | Forward, drop, and omission cases | 109-test suite |
+| 4.5 | 4.4 RED cases | Chat forwarding passed | `max_tokens` validation and options shape | 109-test suite |
+| 4.6 | N/A — regression-test rewrite | Unknown-slug regression passed | Truly unknown second slug | 109-test suite |
+| 4.7 | 4.6 RED case | Registry cleanup suite passed | Failure closes earlier client exactly once | 109-test suite |
+| 4.8 | RED carried by dispatch/allowlist seams | Seven live ASGI cases passed | 200/400/501/502/504 and wire defaults | 109-test suite |
+| 4.9 | N/A — test harness helper | Live ASGI harness passed | Production registry construction path | 109-test suite |
+| 4.10 | RED carried by prior routing seams | Bounded telemetry cases passed | Provider/model/outcome/error-type sets | 121-test suite |
+| 4.11 | 4.10 RED path | Anthropic telemetry label passed | Span and metric dimensions | 121-test suite |
+| 4.12 | N/A — verification task | 122 passed, 95.84% coverage | Ruff, format, and mypy passed | Full cumulative suite |
+| 4.13 | N/A — delivery bookkeeping | Chain checks and task state passed | PR bases, labels, issue approval, budgets | Full cumulative suite |
+
+### Post-verification assertion remediation
+
+The direct follow-up tightened two inherited telemetry tests so they cannot
+pass vacuously: bounded-label checks now require at least one point per
+metric, and the success path explicitly requires zero error points. The
+remediation is intentionally outside RDD and is verified by the direct test
+commands recorded after this artifact was written.
