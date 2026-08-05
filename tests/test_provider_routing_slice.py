@@ -32,6 +32,7 @@ from llmux.core.errors import (
     UpstreamTimeoutError,
     to_openai_envelope,
 )
+from llmux.core.providers.anthropic import AnthropicAdapter
 from llmux.core.providers.base import (
     Chunk,
     CompletionResult,
@@ -58,11 +59,20 @@ _OPENAI_ENV = (
     "OPENAI_MODELS",
     "OPENAI_TIMEOUT_S",
 )
+_ANTHROPIC_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_VERSION",
+    "ANTHROPIC_MODELS",
+    "ANTHROPIC_TIMEOUT_S",
+)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in _OPENAI_ENV:
+        monkeypatch.delenv(var, raising=False)
+    for var in _ANTHROPIC_ENV:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -78,6 +88,19 @@ def _enable(
         monkeypatch.setenv("OPENAI_API_KEY", api_key)
     monkeypatch.setenv("OPENAI_BASE_URL", base_url)
     monkeypatch.setenv("OPENAI_MODELS", models)
+
+
+def _anthropic_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: str = "sk-ant-test-secret-1234",
+    base_url: str = "https://api.anthropic.com",
+    models: str = "claude-3-5-sonnet-20240620",
+) -> None:
+    """Set the ``ANTHROPIC_*`` env vars for ``Settings`` construction."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.setenv("ANTHROPIC_MODELS", models)
 
 
 # ----- 1.1 / 1.2 — OpenAI settings (valid + fail-fast ConfigurationError) --
@@ -419,6 +442,584 @@ async def test_openai_health_reflects_outcome(
     assert isinstance(h, HealthStatus) and h.healthy is healthy
 
 
+# ----- 1.1 / 1.2 — Anthropic settings (valid + fail-fast ConfigurationError) --
+
+
+def _enable_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: str | None = "sk-ant-test",
+    base_url: str = "https://api.anthropic.com",
+    models: str = "claude-3-5-sonnet-20240620",
+) -> None:
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    if api_key is not None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", api_key)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.setenv("ANTHROPIC_MODELS", models)
+
+
+def test_anthropic_settings_valid_parses_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic settings MUST parse all four env-bound fields when enabled."""
+    _enable_anthropic(
+        monkeypatch,
+        api_key="sk-ant-abc",
+        base_url="https://api.anthropic.com",
+        models='["claude-3-5-sonnet-20240620","claude-3-haiku-20240307"]',
+    )
+    monkeypatch.setenv("ANTHROPIC_VERSION", "2023-06-01")
+    monkeypatch.setenv("ANTHROPIC_TIMEOUT_S", "12.5")
+    s = Settings()  # type: ignore[call-arg]
+    assert isinstance(s.anthropic_api_key, SecretStr)
+    assert s.anthropic_api_key.get_secret_value() == "sk-ant-abc"
+    assert s.anthropic_base_url == "https://api.anthropic.com"
+    assert s.anthropic_version == "2023-06-01"
+    assert s.anthropic_models == [
+        "claude-3-5-sonnet-20240620",
+        "claude-3-haiku-20240307",
+    ]
+    assert s.anthropic_timeout_s == 12.5
+
+
+def test_anthropic_settings_default_when_no_provider_configured() -> None:
+    """With no Anthropic provider configured, fields stay at safe defaults and
+    the validator is a no-op (matches the OpenAI default-when-disabled path)."""
+    s = Settings()  # type: ignore[call-arg]
+    assert s.anthropic_api_key is None
+    assert s.anthropic_models == []
+    assert s.anthropic_base_url == "https://api.anthropic.com"
+    assert s.anthropic_version == "2023-06-01"
+    assert s.anthropic_timeout_s == 30.0
+
+
+@pytest.mark.parametrize(
+    "api_key,base_url,models,expected",
+    [
+        (
+            "",
+            "https://api.anthropic.com",
+            "claude-3-5-sonnet-20240620",
+            "ANTHROPIC_API_KEY",
+        ),
+        ("sk-ant-abc", "https://api.anthropic.com", "", "ANTHROPIC_MODELS"),
+        (
+            "sk-ant-abc",
+            "not-a-url",
+            "claude-3-5-sonnet-20240620",
+            "ANTHROPIC_BASE_URL",
+        ),
+    ],
+    ids=["empty_key", "empty_models", "invalid_url"],
+)
+def test_anthropic_settings_invalid_raises_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+    base_url: str,
+    models: str,
+    expected: str,
+) -> None:
+    """Empty key, empty model list, or invalid base URL MUST fail fast with a
+    ``ConfigurationError`` mirroring the OpenAI contract."""
+    _enable_anthropic(monkeypatch, api_key=api_key, base_url=base_url, models=models)
+    with pytest.raises(ConfigurationError) as exc:
+        Settings()  # type: ignore[call-arg]
+    assert expected in str(exc.value)
+    # The error details MUST carry the provider slug for ops/observability.
+    assert exc.value.details.get("provider") == "anthropic"
+
+
+# ----- 2.1 / 2.2 / 2.3 / 2.5 — Anthropic adapter (PR2 scope) -----------------
+
+
+def _anthropic_ok_payload(
+    content: str = "hi from claude", stop_reason: str = "end_turn"
+) -> dict[str, object]:
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20240620",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": stop_reason,
+        "usage": {"input_tokens": 8, "output_tokens": 4},
+    }
+
+
+def _make_anthropic_adapter(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("claude-3-5-sonnet-20240620",),
+    base_url: str = "https://api.anthropic.com",
+    timeout_s: float = 10.0,
+) -> tuple[AnthropicAdapter, httpx.AsyncClient]:
+    # Caller-owned client (adapter never closes it); registry/aclose stays PR4.
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return (
+        AnthropicAdapter(
+            client=client,
+            api_key=SecretStr("sk-ant-test-secret-1234"),
+            base_url=base_url,
+            version="2023-06-01",
+            models=models,
+            timeout_s=timeout_s,
+        ),
+        client,
+    )
+
+
+def _anthropic_capture_handler(
+    captured: dict[str, httpx.Request], payload: dict[str, object] | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    body = payload if payload is not None else _anthropic_ok_payload()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_anthropic_adapter_satisfies_protocol() -> None:
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    assert isinstance(adapter, ProviderAdapter)
+    await client.aclose()
+
+
+def test_anthropic_complete_stream_raises_not_implemented() -> None:
+    adapter, _client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    with pytest.raises(NotImplementedError):
+        adapter.complete_stream(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "x"}]
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_sends_correct_request() -> None:
+    # POST /v1/messages: x-api-key + anthropic-version, no Authorization.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "ping"},
+            ],
+            options={"max_tokens": 256},
+        )
+    finally:
+        await client.aclose()
+    req = captured["request"]
+    assert str(req.url) == "https://api.anthropic.com/v1/messages"
+    assert req.headers["x-api-key"] == "sk-ant-test-secret-1234"
+    assert req.headers["anthropic-version"] == "2023-06-01"
+    assert "Authorization" not in req.headers
+    assert req.headers["Content-Type"] == "application/json"
+    body = json.loads(req.content.decode("utf-8"))
+    assert body["model"] == "claude-3-5-sonnet-20240620"
+    assert body["system"] == "be brief"
+    assert body["max_tokens"] == 256
+    assert body["messages"] == [{"role": "user", "content": "ping"}]
+    assert "stream" not in body
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_multiple_system_messages_joined() -> None:
+    # Multiple ``system`` messages MUST be joined with ``\\n\\n`` and extracted.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [
+                {"role": "system", "content": "first"},
+                {"role": "system", "content": "second"},
+                {"role": "user", "content": "ping"},
+            ],
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["system"] == "first\n\nsecond"
+    assert all(m["role"] != "system" for m in body["messages"])
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_unsupported_role_raises_configuration_error() -> None:
+    # Unsupported roles MUST raise ``ConfigurationError``; content never surfaced.
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    try:
+        with pytest.raises(ConfigurationError):
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620",
+                [
+                    {"role": "user", "content": "ping"},
+                    {"role": "tool", "content": "tool-output-LEAK"},
+                ],
+            )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_omitted_max_tokens_defaults_to_1024() -> None:
+    # Omitted ``max_tokens`` MUST default to ``1024`` on the Anthropic payload.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["max_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_caller_override_512() -> None:
+    # Caller-supplied ``options["max_tokens"]=512`` MUST override the default.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [{"role": "user", "content": "ping"}],
+            options={"max_tokens": 512},
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["max_tokens"] == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,expected",
+    [
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("nope", request=r)),
+            UpstreamError,
+            id="transport_error",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(500, json={"error": "boom"}),
+            UpstreamError,
+            id="upstream_500",
+        ),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.TimeoutException("slow", request=r)),
+            UpstreamTimeoutError,
+            id="timeout",
+        ),
+    ],
+)
+async def test_anthropic_complete_maps_failures_to_typed_errors(
+    factory: Callable[[httpx.Request], httpx.Response],
+    expected: type[Exception],
+) -> None:
+    # Upstream transport/HTTP failures MUST surface as typed ``LLMuxError``
+    # subclasses; upstream body and key never reach the raised error.
+    adapter, client = _make_anthropic_adapter(factory)
+    try:
+        with pytest.raises(expected) as exc:
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620", [{"role": "user", "content": "x"}]
+            )
+        details = getattr(exc.value, "details", None) or {}
+        serialized = json.dumps(
+            {"args": [str(a) for a in exc.value.args], "details": details},
+            default=str,
+        )
+        for token in ("sk-ant-LEAK-1234", "internal-error-payload-LEAK"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+# ----- 3.1 / 3.2 — Anthropic response translation (PR3 scope) ---------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_returns_result_with_expected_fields() -> None:
+    # ``complete`` returns a ``CompletionResult`` from the canonical payload.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=_anthropic_ok_payload("hi back"))
+
+    adapter, client = _make_anthropic_adapter(handler)
+    try:
+        result = await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "hello"}]
+        )
+    finally:
+        await client.aclose()
+    assert isinstance(result, CompletionResult)
+    assert result.content == "hi back"
+    assert result.model == "claude-3-5-sonnet-20240620"
+    assert result.finish_reason == "stop"
+    assert result.prompt_tokens == 8
+    assert result.completion_tokens == 4
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_text_blocks_joined() -> None:
+    # Multiple ``type:"text"`` content blocks MUST be joined in order.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet-20240620",
+                "content": [
+                    {"type": "text", "text": "first "},
+                    {"type": "text", "text": "second"},
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            },
+        )
+
+    adapter, client = _make_anthropic_adapter(handler)
+    try:
+        result = await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+        )
+    finally:
+        await client.aclose()
+    assert result.content == "first second"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_non_text_block_raises_upstream_error() -> None:
+    # A non-text block MUST raise ``UpstreamError``; only the block type is
+    # surfaced, never the block's payload (response-body sanitization).
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet-20240620",
+                "content": [
+                    {"type": "text", "text": "ok"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_test",
+                        "name": "get_weather",
+                        "input": {"city": "sf", "api_key": "sk-ant-LEAK-1234"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    adapter, client = _make_anthropic_adapter(handler)
+    try:
+        with pytest.raises(UpstreamError) as exc:
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+            )
+        details = getattr(exc.value, "details", None) or {}
+        serialized = json.dumps(
+            {"args": [str(a) for a in exc.value.args], "details": details},
+            default=str,
+        )
+        for token in ("sk-ant-LEAK-1234", "get_weather", "toolu_test"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_token_counts_mapped() -> None:
+    # ``input_tokens``/``output_tokens`` map to prompt/completion tokens.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet-20240620",
+                "content": [{"type": "text", "text": "x"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        )
+
+    adapter, client = _make_anthropic_adapter(handler)
+    try:
+        result = await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+        )
+    finally:
+        await client.aclose()
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_reason,expected_finish",
+    [
+        ("end_turn", "stop"),
+        ("stop_sequence", "stop"),
+        ("max_tokens", "length"),
+    ],
+    ids=["end_turn", "stop_sequence", "max_tokens"],
+)
+async def test_anthropic_complete_stop_reason_mapping(
+    stop_reason: str, expected_finish: str
+) -> None:
+    # Only ``end_turn``/``stop_sequence`` -> ``stop`` and ``max_tokens`` -> ``length``.
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(
+            200, json=_anthropic_ok_payload(stop_reason=stop_reason)
+        )
+    )
+    try:
+        result = await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+        )
+    finally:
+        await client.aclose()
+    assert result.finish_reason == expected_finish
+
+
+# ----- 3.3 / 3.4 — Anthropic models() (PR3 scope) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_models_returns_configured_models() -> None:
+    # One ``ModelInfo`` per configured model, provider='anthropic', no streaming.
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json={"data": []}),
+        models=("claude-3-5-sonnet-20240620", "claude-3-haiku-20240307"),
+    )
+    try:
+        models = await adapter.models()
+    finally:
+        await client.aclose()
+    assert tuple(m.id for m in models) == (
+        "claude-3-5-sonnet-20240620",
+        "claude-3-haiku-20240307",
+    )
+    assert all(isinstance(m, ModelInfo) and m.provider == "anthropic" for m in models)
+    assert all(m.supports_streaming is False for m in models)
+
+
+# ----- 3.5 / 3.6 — Anthropic health() reachability (PR3 scope) ---------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,healthy",
+    [
+        pytest.param(lambda r: httpx.Response(200), True, id="2xx_root"),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("nope", request=r)),
+            False,
+            id="transport",
+        ),
+    ],
+)
+async def test_anthropic_health_reflects_outcome(
+    factory: Callable[[httpx.Request], httpx.Response], healthy: bool
+) -> None:
+    # Healthy iff ``GET {base_url}/`` is 2xx; reachability-only, no auth headers.
+    captured: dict[str, httpx.Request] = {}
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return factory(request)
+
+    adapter, client = _make_anthropic_adapter(wrapped)
+    try:
+        h = await adapter.health()
+    finally:
+        await client.aclose()
+    assert isinstance(h, HealthStatus) and h.healthy is healthy
+    # Reachability-only health: GET base_url/ with no Authorization header.
+    assert str(captured["request"].url) == "https://api.anthropic.com/"
+    assert "Authorization" not in captured["request"].headers
+    assert "x-api-key" not in captured["request"].headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,expected",
+    [
+        pytest.param(
+            lambda r: httpx.Response(
+                500,
+                json={
+                    "error": "internal-error-payload-LEAK",
+                    "key": "sk-ant-LEAK-1234",
+                },
+            ),
+            UpstreamError,
+            id="upstream_500_discards_body",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(200, text="<html>not json</html>"),
+            UpstreamError,
+            id="malformed_body",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(
+                200, json={"type": "message", "stop_reason": "end_turn"}
+            ),
+            UpstreamError,
+            id="missing_content",
+        ),
+    ],
+)
+async def test_anthropic_complete_maps_body_errors_to_typed_errors(
+    factory: Callable[[httpx.Request], httpx.Response],
+    expected: type[Exception],
+) -> None:
+    adapter, client = _make_anthropic_adapter(factory)
+    try:
+        with pytest.raises(expected) as exc:
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620", [{"role": "user", "content": "x"}]
+            )
+        details = getattr(exc.value, "details", None) or {}
+        serialized = json.dumps(
+            {"args": [str(a) for a in exc.value.args], "details": details},
+            default=str,
+        )
+        for token in ("sk-ant-LEAK-1234", "internal-error-payload-LEAK"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
 # ----- 3.1 / 3.2 / 3.3 — ProviderRegistry + build_providers -----------------
 
 
@@ -467,12 +1068,18 @@ async def test_build_providers_closes_first_client_on_later_failure(
     """Deterministic factory seam: 1st provider builds, 2nd is unknown.
     The injected factory is called once; the 1st client MUST be closed
     exactly once (no double-close, no leak) before ConfigurationError.
+
+    The 2nd slug is a truly-unknown one (``fake-unknown-slug``) so the
+    mid-build cleanup invariant is still proven after the ``anthropic``
+    slug becomes a valid configured provider in
+    ``anthropic-provider-adapter-slice`` (PR2 adds the dispatch; PR1
+    only adds the Settings contract).
     """
     clients: list[_CountingClient] = []
-    settings = _settings(monkeypatch, providers="openai,anthropic")
+    settings = _settings(monkeypatch, providers="openai,fake-unknown-slug")
     with pytest.raises(ConfigurationError) as exc:
         await build_providers(settings, client_factory=_counting_factory(clients))
-    assert "anthropic" in str(exc.value)
+    assert "fake-unknown-slug" in str(exc.value)
     assert len(clients) == 1
     assert clients[0].is_closed and clients[0].aclose_count == 1
 
@@ -586,6 +1193,33 @@ async def test_aclose_idempotent_after_success(
 
 
 @pytest.mark.asyncio
+async def test_aclose_skips_caller_owned_anthropic_test_client() -> None:
+    """An Anthropic ``MockTransport`` client injected into the registry is
+    caller-owned (``RegistryEntry(client=None)``); the registry MUST NOT
+    re-close it, so after ``aclose()`` the injected client's ``aclose_count``
+    stays at exactly one — the caller's own close.
+
+    Spec: 'Injected Anthropic test client is not double-closed'."""
+    injected = _CountingClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    adapter = AnthropicAdapter(
+        client=injected,
+        api_key=SecretStr("sk-ant-test-secret-1234"),
+        base_url="https://api.anthropic.com",
+        version="2023-06-01",
+        models=("claude-3-5-sonnet-20240620",),
+        timeout_s=10.0,
+    )
+    registry = ProviderRegistry((RegistryEntry(adapter, client=None),))
+    await registry.aclose()
+    await registry.aclose()  # idempotent; still skips caller-owned entries
+    assert not injected.is_closed and injected.aclose_count == 0
+    await injected.aclose()  # the caller owns exactly one close
+    assert injected.is_closed and injected.aclose_count == 1
+
+
+@pytest.mark.asyncio
 async def test_registry_models_aggregates_across_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -624,6 +1258,45 @@ async def test_build_providers_default_factory_creates_and_closes_real_client(
     assert real_client.is_closed
     await registry.aclose()
     await registry.aclose()
+
+
+# 4.1/4.2 RED — anthropic slug dispatch + registry-owned client --------------
+
+
+@pytest.mark.asyncio
+async def test_build_providers_dispatches_anthropic_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``anthropic`` slug MUST dispatch to :class:`AnthropicAdapter` and
+    register it alongside any OpenAI adapter in configured order; the
+    factory-created Anthropic client is registry-owned and closed exactly
+    once by ``aclose()``.
+
+    Spec: 'The anthropic slug dispatches to the Anthropic adapter' +
+    'Ordered Provider Registry And Lifecycle' (registry-owned clients)."""
+    _anthropic_env(monkeypatch)
+    settings = _settings(monkeypatch, providers="openai,anthropic")
+    clients: list[_CountingClient] = []
+    registry = await build_providers(
+        settings, client_factory=_counting_factory(clients)
+    )
+    try:
+        providers = registry.providers
+        assert len(providers) == 2
+        assert isinstance(providers[0], OpenAIAdapter)
+        assert isinstance(providers[1], AnthropicAdapter)
+        assert providers[1].name == "anthropic"
+        models = await registry.models()
+        assert tuple(m.id for m in models) == (
+            "gpt-4o-mini",
+            "claude-3-5-sonnet-20240620",
+        )
+        assert models[1].provider == "anthropic"
+    finally:
+        await registry.aclose()
+    # Both factory-created clients are registry-owned: closed exactly once.
+    assert len(clients) == 2
+    assert all(c.is_closed and c.aclose_count == 1 for c in clients)
 
 
 # ----- 4.1 / 4.2 — Async first-match select_provider ------------------------
@@ -1142,6 +1815,316 @@ async def test_chat_504_on_upstream_timeout(
         await client.aclose()
 
 
+def _make_anthropic_adapter_holder(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("claude-3-5-sonnet-20240620",),
+    base_url: str = "https://api.anthropic.com",
+) -> tuple[AnthropicAdapter, httpx.AsyncClient]:
+    """Live-ASGI holder: an :class:`AnthropicAdapter` with a caller-owned
+    ``MockTransport`` client, ready for ``RegistryEntry(adapter, None)`` —
+    the caller-owned marker the registry MUST NOT re-close."""
+    return _make_anthropic_adapter(handler, models=models, base_url=base_url)
+
+
+def _post_anthropic_chat(client: TestClient, **overrides: object) -> httpx.Response:
+    """POST a chat request for the canonical Anthropic model."""
+    body: dict[str, object] = {"model": "claude-3-5-sonnet-20240620"}
+    body.update(overrides)
+    return _post_chat(client, **body)
+
+
+# 4.4/4.5 RED — chat max_tokens allowlist forwarding --------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_forwards_max_tokens_to_anthropic_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max_tokens`` on the public surface MUST pass the allowlist and
+    reach the Anthropic wire as a caller override."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, max_tokens=512)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 512
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_drops_unknown_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown request extras (e.g. ``temperature``, ``top_p``) MUST NOT be
+    forwarded to any provider — the allowlist admits only ``max_tokens``."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, max_tokens=512, temperature=0.7)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 512
+        assert "temperature" not in sent
+        assert "stream" not in sent  # the Anthropic wire has no stream field
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_max_tokens_omitted_passes_no_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``max_tokens`` MUST pass no override, so the Anthropic
+    adapter applies its own ``1024`` default on the wire."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 200
+        sent = json.loads(captured["request"].content.decode("utf-8"))
+        assert sent["max_tokens"] == 1024
+    finally:
+        await client.aclose()
+
+
+def _counting_mock_factory(
+    handler: Callable[[httpx.Request], httpx.Response],
+    sink: list[_CountingClient],
+) -> ClientFactory:
+    """ClientFactory yielding ``_CountingClient``s backed by the given
+    ``MockTransport`` handler — production-shape clients whose wire calls
+    stay in-process and whose closes are countable."""
+
+    def factory() -> httpx.AsyncClient:
+        client = _CountingClient(transport=httpx.MockTransport(handler))
+        sink.append(client)
+        return client
+
+    return factory
+
+
+def _app_with_real_registry(
+    monkeypatch: pytest.MonkeyPatch, client_factory: ClientFactory
+) -> FastAPI:
+    """Build ``create_app()`` whose lifespan runs the REAL ``build_providers``
+    with an injected client factory against env-driven ``Settings`` — the
+    production construction path (settings → registry → lifespan → routing),
+    in-process. Unlike ``_patch_lifespan``, nothing about the registry or
+    tracing is faked."""
+    import llmux.main as main_mod
+    from llmux.core.providers import registry as registry_mod
+
+    real_build_providers = registry_mod.build_providers
+
+    async def build_with_factory(settings: Settings) -> ProviderRegistry:
+        return await real_build_providers(settings, client_factory=client_factory)
+
+    monkeypatch.setattr(main_mod, "build_providers", build_with_factory)
+    return create_app()
+
+
+# 4.8 RED — live ASGI coverage for the Anthropic chat path --------------------
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_returns_200_openai_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured Anthropic model routes through the unchanged chat path
+    and returns 200 with the gateway's normalized completion envelope
+    (``object``/``created`` injected over the Anthropic raw payload)."""
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter_holder(
+        _anthropic_capture_handler(captured)
+    )
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        body = response.json()
+        assert body["object"] == "chat.completion"
+        assert body["created"] == 0
+        assert body["id"] == "msg_test"
+        assert body["model"] == "claude-3-5-sonnet-20240620"
+        assert body["usage"]["input_tokens"] == 8
+        assert body["usage"]["output_tokens"] == 4
+        assert len(captured) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_400_selection_miss_no_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model no provider offers MUST map to 400 ``model_not_found`` with
+    no upstream invocation and no leak of the requested model id."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json=_anthropic_ok_payload("never reached"))
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, model="claude-unknown-LEAK")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "model_not_found"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "claude-unknown-LEAK" not in json.dumps(body)
+        assert call_count["n"] == 0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_502_upstream_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic HTTP failure → 502 ``upstream_error``; the envelope MUST
+    not leak the upstream body, key, or a stack trace."""
+    secret_key = "sk-ant-LEAK-1234"
+    secret_body = "anthropic-internal-error-LEAK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": secret_body, "key": secret_key})
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"]["code"] == "upstream_error"
+        serialized = json.dumps(body)
+        for token in (secret_key, secret_body, "Traceback", "File '"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_504_timeout_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic timeout → 504 ``upstream_timeout`` with a sanitized
+    envelope (timeout subclass maps to 504 per the stable code map)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("slow", request=request)
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc)
+        assert response.status_code == 504
+        body = response.json()
+        assert body["error"]["code"] == "upstream_timeout"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_stream_true_501_no_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``stream=true`` MUST short-circuit to a JSON 501 with no
+    Anthropic invocation — the strongest evidence is the handler count."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json=_anthropic_ok_payload("never reached"))
+
+    adapter, client = _make_anthropic_adapter_holder(handler)
+    try:
+        registry = ProviderRegistry((RegistryEntry(adapter, None),))
+        app = _app_with_registry(monkeypatch, registry)
+        with TestClient(app) as tc:
+            response = _post_anthropic_chat(tc, stream=True)
+        assert response.status_code == 501
+        assert response.headers["content-type"].startswith("application/json")
+        assert "data:" not in response.text
+        assert call_count["n"] == 0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_max_tokens_512_on_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production path (env Settings → real ``build_providers`` → lifespan →
+    routing): a caller-supplied ``max_tokens=512`` reaches the Anthropic
+    wire, and the factory-created client is registry-owned and closed
+    exactly once at shutdown."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    with TestClient(app) as tc:
+        response = _post_anthropic_chat(tc, max_tokens=512)
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured["request"].content.decode("utf-8"))
+    assert sent["max_tokens"] == 512
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_live_omitted_max_tokens_1024_on_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production path: omitting ``max_tokens`` passes no override, so the
+    Anthropic adapter's ``1024`` default reaches the wire."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    with TestClient(app) as tc:
+        response = _post_anthropic_chat(tc)
+    assert response.status_code == 200, response.text
+    sent = json.loads(captured["request"].content.decode("utf-8"))
+    assert sent["max_tokens"] == 1024
+    assert len(clients) == 1
+    assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
 # ----- 6.1 / 6.2 / 6.5 — PR6 telemetry: span + 3 metrics + sentinel + error --
 
 
@@ -1290,8 +2273,8 @@ async def test_telemetry_model_unknown_sentinel_on_unselected(
 @pytest.mark.asyncio
 async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every label value on every emitted metric MUST be drawn from a
-    fixed, bounded set. The set of providers comes from the
-    configured adapters (``openai``) plus the :data:`PROVIDER_NONE`
+    fixed, bounded set. The set of providers comes from the configured
+    adapters (``openai``, ``anthropic``) plus the :data:`PROVIDER_NONE`
     sentinel; the set of models comes from the configured model list
     plus :data:`MODEL_UNKNOWN`; ``outcome`` is in {success, error};
     ``error.type`` is in the class-level set of LLMuxError error
@@ -1309,7 +2292,7 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
             app.state.telemetry = telemetry
             # Force a selection miss with a free-form model id.
             _post_chat(tc, model="some-arbitrary-unknown-model")
-        bounded_providers = {"openai", "none"}
+        bounded_providers = {"openai", "anthropic", "none"}
         bounded_models = {"gpt-4o-mini", "unknown"}
         bounded_outcomes = {"success", "error"}
         bounded_error_types = {
@@ -1323,7 +2306,9 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
             "chat_completion_errors_total",
             "chat_completion_duration_seconds",
         ):
-            for point in _metric_data_points(metric_reader, name):
+            points = _metric_data_points(metric_reader, name)
+            assert points, f"metric {name} was not recorded"
+            for point in points:
                 attrs = point["attrs"]
                 assert attrs.get("provider") in bounded_providers, (
                     f"{name} provider label {attrs.get('provider')!r} not bounded"
@@ -1340,6 +2325,73 @@ async def test_telemetry_bounded_label_values(monkeypatch: pytest.MonkeyPatch) -
                     )
     finally:
         await client.aclose()
+
+
+# 4.10/4.11 RED — bounded anthropic provider label ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_bounded_anthropic_provider_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed Anthropic hop MUST record the bounded ``provider="anthropic"``
+    label on the span and every metric — a new member of the existing
+    bounded set — with no new metric name or label dimension.
+
+    Spec: 'Anthropic hop records the bounded provider label' + 'Bounded
+    Telemetry Conformance'. Runs on the production construction path so
+    the label is observed on a real dispatched registry, not a stub."""
+    captured: dict[str, httpx.Request] = {}
+    clients: list[_CountingClient] = []
+    monkeypatch.setenv("LLMUX_PROVIDERS_CONFIGURED", "anthropic")
+    _anthropic_env(monkeypatch)
+    app = _app_with_real_registry(
+        monkeypatch,
+        _counting_mock_factory(_anthropic_capture_handler(captured), clients),
+    )
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    with TestClient(app) as tc:
+        app.state.telemetry = telemetry
+        response = _post_anthropic_chat(tc)
+    assert response.status_code == 200, response.text
+    # Exactly one chat span with provider="anthropic" and the canonical
+    # result model (bounded set members only).
+    spans = _chat_spans(span_exporter)
+    assert len(spans) == 1
+    attrs = _span_attrs(spans[0])
+    assert attrs.get("provider") == "anthropic"
+    assert attrs.get("model") == "claude-3-5-sonnet-20240620"
+    assert attrs.get("outcome") == "success"
+    assert attrs.get("error.type") == "none"
+    # No new metric name and no label dimension outside the existing
+    # contract; every data point carries the anthropic provider label.
+    bounded_dimensions = {"provider", "model", "outcome", "error.type"}
+    known_metric_names = {
+        "chat_completion_requests_total",
+        "chat_completion_errors_total",
+        "chat_completion_duration_seconds",
+    }
+    data = metric_reader.get_metrics_data()
+    assert data is not None
+    seen_names: set[str] = set()
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for m in sm.metrics:
+                seen_names.add(m.name)
+                assert m.name in known_metric_names, f"new metric {m.name!r}"
+                for dp in m.data.data_points:
+                    dp_attrs = {
+                        str(k): (str(v) if v is not None else "")
+                        for k, v in (dp.attributes or {}).items()
+                    }
+                    assert set(dp_attrs) <= bounded_dimensions, (
+                        f"{m.name} leaked dimension "
+                        f"{set(dp_attrs) - bounded_dimensions}"
+                    )
+                    assert dp_attrs.get("provider") == "anthropic"
+    assert seen_names <= known_metric_names
+    assert "chat_completion_requests_total" in seen_names
+    assert "chat_completion_duration_seconds" in seen_names
 
 
 # 6.2 RED — span error status with error.type attribute ---------------------
@@ -1571,10 +2623,9 @@ async def test_telemetry_chat_span_and_three_metrics_on_success(
         # instrument is exposed), but no data point is emitted until
         # an actual error path increments the counter.
         errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
-        for p in errors:
-            assert p["attrs"].get("outcome") != "error", (
-                "errors_total must not be incremented on success"
-            )
+        assert errors == [], (
+            "errors_total must not emit a data point on the success path"
+        )
     finally:
         await client.aclose()
 
