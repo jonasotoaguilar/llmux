@@ -2,15 +2,33 @@
 
 Implements the :class:`ProviderAdapter` port for the Anthropic Messages API
 (``POST {base_url}/v1/messages``). ``complete_stream`` is out of scope and
-raises ``NotImplementedError``; the HTTP client is injected so tests can
-supply ``httpx.MockTransport``.
+raises ``NotImplementedError`` (streaming/SSE is explicitly deferred). The
+HTTP client is injected so tests can supply ``httpx.MockTransport``;
+production ownership is established by the registry in a later PR.
 
-Auth uses ``x-api-key`` + ``anthropic-version``; system messages are
-extracted into a top-level ``system`` field (multiple messages joined
-with ``\\n\\n``); unsupported roles raise :class:`ConfigurationError`;
-``max_tokens`` defaults to ``1024`` unless overridden via options. HTTP
-4xx/5xx, transport errors, and timeouts normalize to the existing
-:class:`LLMuxError` hierarchy; the upstream body is discarded.
+Translation rules (per the ``anthropic-provider`` spec):
+
+* Auth: ``x-api-key`` + ``anthropic-version`` headers. ``Authorization`` is
+  never used.
+* System messages are extracted out of the ``messages`` array into a
+  top-level ``system`` field; multiple system messages are joined with
+  ``\\n\\n``; the system-message cache-control block is intentionally dropped
+  (prompt caching is deferred).
+* Unsupported roles (``tool``/``function``) raise :class:`ConfigurationError`.
+* ``max_tokens`` defaults to ``1024`` when the caller omits it; a
+  caller-supplied ``options["max_tokens"]`` overrides the default.
+* Response ``type:"text"`` content blocks are joined in order; any non-text
+  block (e.g. ``tool_use``) raises a sanitized :class:`UpstreamError`.
+* ``usage.input_tokens`` -> ``prompt_tokens``;
+  ``usage.output_tokens`` -> ``completion_tokens``.
+* Only three stop-reason mappings are admitted: ``end_turn`` -> ``stop``,
+  ``stop_sequence`` -> ``stop``, ``max_tokens`` -> ``length``.
+* HTTP 4xx/5xx, transport errors, and timeouts are normalized to the
+  existing :class:`LLMuxError` hierarchy. The upstream body is discarded
+  (the safe envelope never leaks it).
+* ``models()`` returns the configured model list; ``health()`` probes
+  ``GET {base_url}/`` reachability only and MUST NOT perform an
+  auth-validity probe (deferred).
 """
 
 from __future__ import annotations
@@ -30,6 +48,14 @@ from llmux.core.providers.base import (
 )
 
 DEFAULT_MAX_TOKENS: int = 1024
+#: Admitted Anthropic -> gateway stop-reason mappings (spec contract).
+#: ``end_turn`` and ``stop_sequence`` both collapse to ``stop``; the only
+#: non-stop admission is ``max_tokens`` -> ``length``.
+_STOP_REASON_MAP: dict[str, str] = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+}
 _ADMITTED_MESSAGE_ROLES: frozenset[str] = frozenset({"system", "user", "assistant"})
 _SYSTEM_JOINER: str = "\n\n"
 _PROVIDER: str = "anthropic"
@@ -94,14 +120,7 @@ class AnthropicAdapter:
             data = response.json()
         except (ValueError, json.JSONDecodeError) as exc:
             raise UpstreamError("Anthropic returned non-JSON body") from exc
-        return CompletionResult(
-            content="",
-            model=model,
-            prompt_tokens=0,
-            completion_tokens=0,
-            finish_reason="stop",
-            raw=data,
-        )
+        return _parse_completion(data, default_model=model)
 
     def complete_stream(
         self,
@@ -109,15 +128,25 @@ class AnthropicAdapter:
         messages: Sequence[Mapping[str, object]],
         options: Mapping[str, object] | None = None,
     ) -> AsyncIterator[Chunk]:
+        """Streaming is out of scope; raise ``NotImplementedError``."""
         raise NotImplementedError(
             "Anthropic streaming is out of scope; use complete() for non-streaming."
         )
 
     async def models(self) -> Sequence[ModelInfo]:
-        raise NotImplementedError("PR3")
+        """Return one ``ModelInfo`` per configured model."""
+        return tuple(
+            ModelInfo(id=m, provider=self.name, supports_streaming=False)
+            for m in self._models
+        )
 
     async def health(self) -> HealthStatus:
-        raise NotImplementedError("PR3")
+        """Probe reachability via ``GET {base_url}/`` only; no auth probe."""
+        try:
+            response = await self._client.get(f"{self._base_url}/")
+        except httpx.HTTPError as exc:
+            return HealthStatus(healthy=False, error=type(exc).__name__)
+        return HealthStatus(healthy=response.status_code < 400, latency_ms=None)
 
 
 def _build_request(
@@ -180,3 +209,61 @@ def _resolve_max_tokens(options: Mapping[str, object] | None) -> int:
         except ValueError:
             return DEFAULT_MAX_TOKENS
     return DEFAULT_MAX_TOKENS
+
+
+def _parse_completion(data: object, *, default_model: str) -> CompletionResult:
+    """Translate an Anthropic Messages response payload into a ``CompletionResult``."""
+    if not isinstance(data, dict):
+        raise UpstreamError("Anthropic response is not a JSON object")
+    content_blocks = data.get("content")
+    if not isinstance(content_blocks, list):
+        raise UpstreamError("Anthropic response missing 'content' array")
+    text_parts: list[str] = []
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            raise UpstreamError("Anthropic content block is not an object")
+        block_type = block.get("type")
+        if block_type != "text":
+            # Non-text blocks (tool_use, image, etc.) are out of scope; reject
+            # with only the block type — never the block's payload.
+            raise UpstreamError(
+                f"Anthropic returned a non-text content block: {block_type!r}",
+                provider=_PROVIDER,
+            )
+        text = block.get("text")
+        text_parts.append("" if text is None else str(text))
+    usage_obj = data.get("usage")
+    usage = usage_obj if isinstance(usage_obj, dict) else {}
+    return CompletionResult(
+        content="".join(text_parts),
+        model=str(data.get("model", default_model)),
+        prompt_tokens=_coerce_int(usage.get("input_tokens")),
+        completion_tokens=_coerce_int(usage.get("output_tokens")),
+        finish_reason=_map_stop_reason(data.get("stop_reason")),
+        raw=data,
+    )
+
+
+def _coerce_int(value: object) -> int:
+    """Coerce an arbitrary object into an int (default ``0`` on failure)."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _map_stop_reason(stop_reason: object) -> str:
+    """Map an Anthropic ``stop_reason`` to the gateway finish reason.
+
+    Only ``end_turn``/``stop_sequence`` -> ``stop`` and ``max_tokens`` ->
+    ``length`` are admitted; other values pass through unchanged.
+    """
+    if stop_reason is None:
+        return "stop"
+    return _STOP_REASON_MAP.get(str(stop_reason), str(stop_reason))
