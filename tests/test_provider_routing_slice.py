@@ -32,6 +32,7 @@ from llmux.core.errors import (
     UpstreamTimeoutError,
     to_openai_envelope,
 )
+from llmux.core.providers.anthropic import AnthropicAdapter
 from llmux.core.providers.base import (
     Chunk,
     CompletionResult,
@@ -514,6 +515,222 @@ def test_anthropic_settings_invalid_raises_configuration_error(
     assert expected in str(exc.value)
     # The error details MUST carry the provider slug for ops/observability.
     assert exc.value.details.get("provider") == "anthropic"
+
+
+# ----- 2.1 / 2.2 / 2.3 / 2.5 — Anthropic adapter (PR2 scope) -----------------
+
+
+def _anthropic_ok_payload(
+    content: str = "hi from claude", stop_reason: str = "end_turn"
+) -> dict[str, object]:
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20240620",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": stop_reason,
+        "usage": {"input_tokens": 8, "output_tokens": 4},
+    }
+
+
+def _make_anthropic_adapter(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    models: tuple[str, ...] = ("claude-3-5-sonnet-20240620",),
+    base_url: str = "https://api.anthropic.com",
+    timeout_s: float = 10.0,
+) -> tuple[AnthropicAdapter, httpx.AsyncClient]:
+    # Caller-owned client (adapter never closes it); registry/aclose stays PR4.
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return (
+        AnthropicAdapter(
+            client=client,
+            api_key=SecretStr("sk-ant-test-secret-1234"),
+            base_url=base_url,
+            version="2023-06-01",
+            models=models,
+            timeout_s=timeout_s,
+        ),
+        client,
+    )
+
+
+def _anthropic_capture_handler(
+    captured: dict[str, httpx.Request], payload: dict[str, object] | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    body = payload if payload is not None else _anthropic_ok_payload()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_anthropic_adapter_satisfies_protocol() -> None:
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    assert isinstance(adapter, ProviderAdapter)
+    await client.aclose()
+
+
+def test_anthropic_complete_stream_raises_not_implemented() -> None:
+    adapter, _client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    with pytest.raises(NotImplementedError):
+        adapter.complete_stream(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "x"}]
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_sends_correct_request() -> None:
+    # POST /v1/messages: x-api-key + anthropic-version, no Authorization.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "ping"},
+            ],
+            options={"max_tokens": 256},
+        )
+    finally:
+        await client.aclose()
+    req = captured["request"]
+    assert str(req.url) == "https://api.anthropic.com/v1/messages"
+    assert req.headers["x-api-key"] == "sk-ant-test-secret-1234"
+    assert req.headers["anthropic-version"] == "2023-06-01"
+    assert "Authorization" not in req.headers
+    assert req.headers["Content-Type"] == "application/json"
+    body = json.loads(req.content.decode("utf-8"))
+    assert body["model"] == "claude-3-5-sonnet-20240620"
+    assert body["system"] == "be brief"
+    assert body["max_tokens"] == 256
+    assert body["messages"] == [{"role": "user", "content": "ping"}]
+    assert "stream" not in body
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_multiple_system_messages_joined() -> None:
+    # Multiple ``system`` messages MUST be joined with ``\\n\\n`` and extracted.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [
+                {"role": "system", "content": "first"},
+                {"role": "system", "content": "second"},
+                {"role": "user", "content": "ping"},
+            ],
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["system"] == "first\n\nsecond"
+    assert all(m["role"] != "system" for m in body["messages"])
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_unsupported_role_raises_configuration_error() -> None:
+    # Unsupported roles MUST raise ``ConfigurationError``; content never surfaced.
+    adapter, client = _make_anthropic_adapter(
+        lambda r: httpx.Response(200, json=_anthropic_ok_payload())
+    )
+    try:
+        with pytest.raises(ConfigurationError):
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620",
+                [
+                    {"role": "user", "content": "ping"},
+                    {"role": "tool", "content": "tool-output-LEAK"},
+                ],
+            )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_omitted_max_tokens_defaults_to_1024() -> None:
+    # Omitted ``max_tokens`` MUST default to ``1024`` on the Anthropic payload.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620", [{"role": "user", "content": "ping"}]
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["max_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_caller_override_512() -> None:
+    # Caller-supplied ``options["max_tokens"]=512`` MUST override the default.
+    captured: dict[str, httpx.Request] = {}
+    adapter, client = _make_anthropic_adapter(_anthropic_capture_handler(captured))
+    try:
+        await adapter.complete(
+            "claude-3-5-sonnet-20240620",
+            [{"role": "user", "content": "ping"}],
+            options={"max_tokens": 512},
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured["request"].content.decode("utf-8"))
+    assert body["max_tokens"] == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,expected",
+    [
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("nope", request=r)),
+            UpstreamError,
+            id="transport_error",
+        ),
+        pytest.param(
+            lambda r: httpx.Response(500, json={"error": "boom"}),
+            UpstreamError,
+            id="upstream_500",
+        ),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.TimeoutException("slow", request=r)),
+            UpstreamTimeoutError,
+            id="timeout",
+        ),
+    ],
+)
+async def test_anthropic_complete_maps_failures_to_typed_errors(
+    factory: Callable[[httpx.Request], httpx.Response],
+    expected: type[Exception],
+) -> None:
+    # Upstream transport/HTTP failures MUST surface as typed ``LLMuxError``
+    # subclasses; upstream body and key never reach the raised error.
+    adapter, client = _make_anthropic_adapter(factory)
+    try:
+        with pytest.raises(expected) as exc:
+            await adapter.complete(
+                "claude-3-5-sonnet-20240620", [{"role": "user", "content": "x"}]
+            )
+        details = getattr(exc.value, "details", None) or {}
+        serialized = json.dumps(
+            {"args": [str(a) for a in exc.value.args], "details": details},
+            default=str,
+        )
+        for token in ("sk-ant-LEAK-1234", "internal-error-payload-LEAK"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await client.aclose()
 
 
 # ----- 3.1 / 3.2 / 3.3 — ProviderRegistry + build_providers -----------------
