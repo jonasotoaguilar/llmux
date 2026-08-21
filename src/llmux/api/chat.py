@@ -38,14 +38,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from llmux.core.errors import LLMuxError, to_openai_envelope
+from llmux.core.errors import (
+    AllProvidersFailedError,
+    LLMuxError,
+    is_retryable,
+    to_openai_envelope,
+)
 from llmux.core.providers.base import CompletionResult
 from llmux.core.providers.registry import ProviderRegistry
 from llmux.core.router import select_candidates
 from llmux.observability.metrics import (
     MODEL_UNKNOWN,
     PROVIDER_NONE,
-    ChatCompletionTimer,
     ChatTelemetry,
     NoopChatTelemetry,
 )
@@ -124,15 +128,20 @@ async def post_chat_completion(
 
     - ``stream`` explicitly ``True`` → 501 ``not_implemented`` JSON
       (no provider call, no telemetry, no SSE) — short-circuited
-      BEFORE the telemetry timer is opened so the rejected path is
+      BEFORE any telemetry timer is opened so the rejected path is
       never recorded (per the no-fake-SSE contract).
     - ``stream`` ``False`` (explicit or omitted → Pydantic default) →
-      async ``select_candidates`` then ``candidates[0].complete``
-      wrapped in a :class:`ChatCompletionTimer`. 200 OpenAI-shaped
-      envelope on success, sanitized ``LLMuxError`` envelope on typed
-      failure. A non-``LLMuxError`` exception is caught by the timer,
-      recorded as ``error.type=internal_error`` + ``Status(ERROR)``,
-      then re-raised so FastAPI returns a 500.
+      async ``select_candidates`` then a sequential attempt chain where
+      each candidate's ``complete`` call runs inside its OWN
+      :class:`ChatCompletionTimer`: first success returns the 200
+      OpenAI-shaped envelope; retryable ``LLMuxError`` failures (see
+      :func:`is_retryable`) record that attempt's error hop then
+      advance; a non-retryable typed failure records and returns its
+      sanitized envelope; exhaustion returns the sanitized 503
+      ``AllProvidersFailedError`` envelope with no extra hop (every
+      attempt already recorded one). A non-``LLMuxError`` exception is
+      recorded by the attempt's timer as ``error.type=internal_error``
+      and re-raised so FastAPI returns a 500.
     """
     # 1. Explicit stream=true short-circuit — MUST run before any
     #    telemetry work so the rejected path emits no span or metric.
@@ -146,15 +155,12 @@ async def post_chat_completion(
         request.app.state, "telemetry", _NOOP_TELEMETRY
     )
     registry: ProviderRegistry | None = getattr(request.app.state, "providers", None)
-    # 2. Open the chat-completion timer. MODEL_UNKNOWN until selection
-    #    resolves; the timer accepts the setters below to update the
-    #    canonical post-routing provider/model/error_type.
-    with telemetry.start(provider=None, model=MODEL_UNKNOWN) as timer:
-        if not isinstance(timer, ChatCompletionTimer):
-            # NoopChatTelemetry returns a different timer shape; both
-            # expose the same setters, so the call shape is uniform.
-            pass
-        if registry is None:
+    # 2. Pre-routing failures keep exactly one bounded hop with the
+    #    provider=none / model=unknown sentinels: a missing registry
+    #    (startup configuration fault) and a selection miss both return
+    #    their sanitized envelope without touching any adapter.
+    if registry is None:
+        with telemetry.start(provider=None, model=MODEL_UNKNOWN) as timer:
             # Lifespan never ran (test harness without lifespan) —
             # treat as a startup configuration fault per the spec's
             # ConfigurationError mapping (502, never 400).
@@ -164,46 +170,55 @@ async def post_chat_completion(
             timer.set_error_type(type(err).error_type)
             timer.mark_error()
             return _error_response(err)
-        try:
-            candidates = await select_candidates(body.model, registry)
-            adapter = candidates[0]
-        except LLMuxError as exc:
-            # model label stays MODEL_UNKNOWN for selection miss so the
-            # bounded set never sees the raw request model.
+    try:
+        candidates = await select_candidates(body.model, registry)
+    except LLMuxError as exc:
+        # model label stays MODEL_UNKNOWN for selection miss so the
+        # bounded set never sees the raw request model.
+        with telemetry.start(provider=None, model=MODEL_UNKNOWN) as timer:
             timer.set_error_type(type(exc).error_type)
             timer.mark_error()
             return _error_response(exc)
-        # The Protocol does not require ``name`` (it would break
-        # ``issubclass`` on ``runtime_checkable`` Protocols). The bounded
-        # PROVIDER_NONE sentinel is the fallback for adapters that do
-        # not expose ``name`` so the metric label never escapes the
-        # bounded set.
-        timer.set_provider(getattr(adapter, "name", PROVIDER_NONE))
-        # The model label is the request model as soon as the router
-        # has selected a provider. This MUST be set BEFORE the adapter
-        # call so an unexpected (non-LLMuxError) exception bubbling
-        # out of the adapter still records the request model on the
-        # error metric — the bounded set stays bounded and
-        # MODEL_UNKNOWN is reserved for the selection-miss branch.
-        timer.set_model(body.model)
-        try:
-            result = await adapter.complete(
-                body.model,
-                [m.model_dump(exclude_none=True) for m in body.messages],
-                options=_allowlist_options(body),
+    # 3. Sequential attempt chain: each candidate exactly once, in
+    #    order, each attempt wrapped in its OWN ChatCompletionTimer so
+    #    ``requests_total`` counts attempts and every hop carries its
+    #    own provider/outcome/error.type. Retryable failures record an
+    #    error hop then advance; terminal errors record and stop.
+    for adapter in candidates:
+        with telemetry.start(provider=None, model=MODEL_UNKNOWN) as timer:
+            # ``name`` is not on the Protocol; PROVIDER_NONE keeps the
+            # metric label bounded for adapters without it.
+            timer.set_provider(getattr(adapter, "name", PROVIDER_NONE))
+            # Request model BEFORE the call so an unexpected exception
+            # still records a bounded model label.
+            timer.set_model(body.model)
+            try:
+                result = await adapter.complete(
+                    body.model,
+                    [m.model_dump(exclude_none=True) for m in body.messages],
+                    options=_allowlist_options(body),
+                )
+            except LLMuxError as exc:
+                if is_retryable(exc):
+                    # Record THIS attempt's error hop (failing
+                    # provider, bounded error.type), then advance to
+                    # the next candidate; the chain may still win.
+                    timer.set_error_type(type(exc).error_type)
+                    timer.mark_error()
+                    continue
+                timer.set_error_type(type(exc).error_type)
+                timer.mark_error()
+                return _error_response(exc)
+            # Success: the model label is the canonical result model.
+            timer.set_model(result.model)
+            return JSONResponse(
+                status_code=200,
+                content=_completion_envelope(result),
+                media_type="application/json",
             )
-        except LLMuxError as exc:
-            timer.set_error_type(type(exc).error_type)
-            timer.mark_error()
-            return _error_response(exc)
-        # On success the model label is the canonical result model
-        # returned by the provider, not the request model.
-        timer.set_model(result.model)
-        return JSONResponse(
-            status_code=200,
-            content=_completion_envelope(result),
-            media_type="application/json",
-        )
+    # 4. Exhaustion: sanitized 503, no synthetic hop — every attempt
+    #    already recorded its own error hop above.
+    return _error_response(AllProvidersFailedError())
 
 
 __all__: list[str] = ["chat_router", "post_chat_completion", "NOT_IMPLEMENTED_ERROR"]
