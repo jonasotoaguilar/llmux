@@ -6,6 +6,7 @@ wiring, and the /v1/models endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from typing import TypedDict
@@ -298,7 +299,6 @@ def test_all_providers_failed_envelope_sanitized() -> None:
     serialized = json.dumps(body)
     for token in ("sk-LEAK", "<html>", "Traceback", "File 'x.py'"):
         assert token not in serialized, f"envelope leaked {token!r}"
-
 
 
 # ----- 2.1 / 2.2 / 2.3 — OpenAI adapter (httpx.MockTransport) -------------
@@ -1864,13 +1864,15 @@ async def test_chat_400_on_provider_selection_error(
 
 @pytest.mark.asyncio
 async def test_chat_502_on_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Upstream 4xx/5xx → 502 ``upstream_error``; envelope MUST be
-    sanitized (no key, no upstream body, no stack trace)."""
+    """A non-retryable upstream 4xx (401) → 502 ``upstream_error``; the
+    chain stops and the envelope MUST be sanitized (no key, no upstream
+    body, no stack trace). Retryable 5xx on the only candidate instead
+    exhausts the chain → 503 (see the fallback matrix)."""
     secret_key = "sk-LEAK-1234"
     secret_body = "internal-error-payload-LEAK"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": secret_body, "key": secret_key})
+        return httpx.Response(401, json={"error": secret_body, "key": secret_key})
 
     adapter, client = _make_adapter(handler)
     try:
@@ -1889,12 +1891,12 @@ async def test_chat_502_on_upstream_error(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_chat_504_on_upstream_timeout(
+async def test_chat_all_providers_failed_503_on_single_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """httpx.TimeoutException from the adapter → 504 ``upstream_timeout``
-    with a sanitized envelope (timeout subclass maps to 504 per the
-    design's stable code map)."""
+    """A single-candidate registry whose only provider times out
+    exhausts the chain → sanitized 503 ``all_providers_failed`` (the
+    timeout's own 504 envelope is replaced by the exhaustion envelope)."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("slow", request=request)
@@ -1905,9 +1907,10 @@ async def test_chat_504_on_upstream_timeout(
         app = _app_with_registry(monkeypatch, registry)
         with TestClient(app) as tc:
             response = _post_chat(tc)
-        assert response.status_code == 504
+        assert response.status_code == 503
         body = response.json()
-        assert body["error"]["code"] == "upstream_timeout"
+        assert body["error"]["code"] == "all_providers_failed"
+        assert body["error"]["type"] == "api_error"
     finally:
         await client.aclose()
 
@@ -2098,11 +2101,12 @@ async def test_anthropic_chat_400_selection_miss_no_invocation(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_chat_502_upstream_sanitized(
+async def test_anthropic_chat_all_providers_failed_503_sanitized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Anthropic HTTP failure → 502 ``upstream_error``; the envelope MUST
-    not leak the upstream body, key, or a stack trace."""
+    """Anthropic 5xx on the only candidate exhausts the chain → 503
+    ``all_providers_failed``; the envelope MUST not leak the upstream
+    body, key, or a stack trace."""
     secret_key = "sk-ant-LEAK-1234"
     secret_body = "anthropic-internal-error-LEAK"
 
@@ -2115,9 +2119,9 @@ async def test_anthropic_chat_502_upstream_sanitized(
         app = _app_with_registry(monkeypatch, registry)
         with TestClient(app) as tc:
             response = _post_anthropic_chat(tc)
-        assert response.status_code == 502
+        assert response.status_code == 503
         body = response.json()
-        assert body["error"]["code"] == "upstream_error"
+        assert body["error"]["code"] == "all_providers_failed"
         serialized = json.dumps(body)
         for token in (secret_key, secret_body, "Traceback", "File '"):
             assert token not in serialized, f"envelope leaked {token!r}"
@@ -2126,11 +2130,11 @@ async def test_anthropic_chat_502_upstream_sanitized(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_chat_504_timeout_sanitized(
+async def test_anthropic_chat_all_providers_failed_timeout_sanitized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Anthropic timeout → 504 ``upstream_timeout`` with a sanitized
-    envelope (timeout subclass maps to 504 per the stable code map)."""
+    """Anthropic timeout on the only candidate exhausts the chain →
+    sanitized 503 ``all_providers_failed`` envelope."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("slow", request=request)
@@ -2141,9 +2145,9 @@ async def test_anthropic_chat_504_timeout_sanitized(
         app = _app_with_registry(monkeypatch, registry)
         with TestClient(app) as tc:
             response = _post_anthropic_chat(tc)
-        assert response.status_code == 504
+        assert response.status_code == 503
         body = response.json()
-        assert body["error"]["code"] == "upstream_timeout"
+        assert body["error"]["code"] == "all_providers_failed"
     finally:
         await client.aclose()
 
@@ -2220,6 +2224,226 @@ async def test_anthropic_live_omitted_max_tokens_1024_on_wire(
     assert sent["max_tokens"] == 1024
     assert len(clients) == 1
     assert clients[0].is_closed and clients[0].aclose_count == 1
+
+
+# ----- 3.1 / 3.2 / 3.3 — fallback attempt chain (PR2 scope) -----------------
+
+
+def _two_candidate_app(
+    monkeypatch: pytest.MonkeyPatch, a: ProviderAdapter, b: ProviderAdapter
+) -> FastAPI:
+    registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
+    return _app_with_registry(monkeypatch, registry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "a_failure",
+    [
+        pytest.param(lambda r: httpx.Response(500), id="5xx"),
+        pytest.param(lambda r: httpx.Response(408), id="408"),
+        pytest.param(lambda r: httpx.Response(429), id="429"),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.TimeoutException("slow", request=r)),
+            id="timeout",
+        ),
+        pytest.param(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("nope", request=r)),
+            id="transport",
+        ),
+    ],
+)
+async def test_fallback_matrix_retryable_fails_over_to_b(
+    monkeypatch: pytest.MonkeyPatch,
+    a_failure: Callable[[httpx.Request], httpx.Response],
+) -> None:
+    """5xx, 408, 429, timeout, and statusless transport MUST all fail
+    over to B (200 envelope); each candidate exactly once, A first."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return a_failure(request)
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(200, json=_ok_payload("hi from b"))
+
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "hi from b"
+        assert counts == {"a": 1, "b": 1}
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fallback_stops_on_401_b_unattempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-retryable 401 on A MUST stop the chain, surface A's
+    sanitized 502 ``upstream_error`` envelope, and never attempt B."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(401, json={"error": "unauthorized-body-LEAK"})
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(200, json=_ok_payload("never reached"))
+
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"]["code"] == "upstream_error"
+        assert counts == {"a": 1, "b": 0}
+        serialized = json.dumps(body)
+        for token in ("unauthorized-body-LEAK", "Traceback", "File '"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fallback_all_providers_failed_503_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-candidates-fail → sanitized 503 ``all_providers_failed`` with
+    no upstream body, key, or stack trace; each attempted exactly once."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(500, json={"error": "a-body-LEAK", "key": "sk-a-LEAK"})
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(503, json={"error": "b-body-LEAK", "key": "sk-b-LEAK"})
+
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 503
+        body = response.json()
+        assert body["error"]["code"] == "all_providers_failed"
+        assert body["error"]["type"] == "api_error"
+        assert counts == {"a": 1, "b": 1}
+        serialized = json.dumps(body)
+        for token in ("a-body-LEAK", "b-body-LEAK", "sk-a-LEAK", "sk-b-LEAK"):
+            assert token not in serialized, f"envelope leaked {token!r}"
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fallback_first_success_short_circuits_b_unattempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A success on A MUST win immediately; B is never attempted."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(200, json=_ok_payload("hi from a"))
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(200, json=_ok_payload("never reached"))
+
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "hi from a"
+        assert counts == {"a": 1, "b": 0}
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fallback_attempts_in_order_exactly_once_no_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempts run in configured order, exactly once each, strictly
+    sequential: interleaved start/end markers prove no overlap and no
+    re-attempt of a failed provider."""
+    sequence: list[str] = []
+
+    async def a_handler(request: httpx.Request) -> httpx.Response:
+        sequence.append("a-start")
+        await asyncio.sleep(0.01)
+        sequence.append("a-end")
+        return httpx.Response(500, json={"error": "boom"})
+
+    async def b_handler(request: httpx.Request) -> httpx.Response:
+        sequence.append("b-start")
+        await asyncio.sleep(0.01)
+        sequence.append("b-end")
+        return httpx.Response(500, json={"error": "also boom"})
+
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc)
+        assert response.status_code == 503
+        assert sequence == ["a-start", "a-end", "b-start", "b-end"]
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fallback_disjoint_model_ids_no_failover_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disjoint model ids keep B outside the chain: a ``gpt-4`` request
+    fails retryably on A and exhausts its single candidate → sanitized
+    503; B (``claude-3``) is never attempted."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(500, json={"error": "boom"})
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(200, json=_ok_payload("never reached"))
+
+    a, ac = _make_adapter(a_handler, models=("gpt-4",))
+    b, bc = _make_adapter(b_handler, models=("claude-3",))
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            response = _post_chat(tc, model="gpt-4")
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "all_providers_failed"
+        assert counts == {"a": 1, "b": 0}
+    finally:
+        await ac.aclose()
+        await bc.aclose()
 
 
 # ----- 6.1 / 6.2 / 6.5 — PR6 telemetry: span + 3 metrics + sentinel + error --
@@ -2356,7 +2580,10 @@ async def test_telemetry_model_unknown_sentinel_on_unselected(
             "chat_completion_duration_seconds",
         ):
             points = _metric_data_points(metric_reader, name)
-            assert points, f"metric {name} not recorded"
+            assert len(points) == 1, (
+                f"selection miss must emit exactly one {name} hop, "
+                f"got {len(points)}"
+            )
             for p in points:
                 assert p["attrs"].get("model") == "unknown", (
                     f"{name} leaked raw model: {p['attrs']}"
@@ -2498,9 +2725,9 @@ async def test_telemetry_bounded_anthropic_provider_label(
 async def test_telemetry_span_error_status_with_error_type_attribute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A routed call that ends in :class:`UpstreamError` MUST emit a
-    span with ``Status(StatusCode.ERROR, error_type)`` AND an
-    ``error.type`` attribute carrying the same bounded label. The
+    """A routed call whose chain exhausts (single candidate 5xx → 503)
+    MUST emit a span with ``Status(StatusCode.ERROR, error_type)`` AND
+    an ``error.type`` attribute carrying the same bounded label. The
     status description is the bounded ``error_type`` (NOT the
     upstream payload, key, or exception message) so the sanitization
     contract holds for the span as well as the response envelope."""
@@ -2519,7 +2746,7 @@ async def test_telemetry_span_error_status_with_error_type_attribute(
         with TestClient(app) as tc:
             app.state.telemetry = telemetry
             response = _post_chat(tc)
-        assert response.status_code == 502
+        assert response.status_code == 503
         spans = _chat_spans(span_exporter)
         assert len(spans) == 1
         span = spans[0]
