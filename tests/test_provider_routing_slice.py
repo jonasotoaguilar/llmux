@@ -2990,3 +2990,117 @@ async def test_telemetry_stream_true_still_bypasses_all_telemetry(
             )
     finally:
         await client.aclose()
+
+
+# ----- 4.1 / 4.2 / 4.3 — per-attempt telemetry hops (PR3 scope) -------------
+
+
+@pytest.mark.asyncio
+async def test_telemetry_per_attempt_error_then_success_hops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retryable A failure followed by B success MUST emit one error
+    hop for A and one success hop for B: two ``chat.completion`` spans,
+    ``requests_total`` counting attempts (one point per hop), and the
+    error counter only for A. Labels stay within the bounded sets
+    (provider/model/outcome/error.type)."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(500, json={"error": "boom"})
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(200, json=_ok_payload("hi from b"))
+
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    a.name = "a"
+    b.name = "b"
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            response = _post_chat(tc)
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "hi from b"
+        assert counts == {"a": 1, "b": 1}
+        # One hop per attempt: A's error hop first, B's success hop second.
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 2
+        a_span, b_span = spans
+        assert _span_attrs(a_span).get("provider") == "a"
+        assert _span_attrs(a_span).get("model") == "gpt-4o-mini"
+        assert _span_attrs(a_span).get("outcome") == "error"
+        assert _span_attrs(a_span).get("error.type") == "api_error"
+        assert _span_attrs(b_span).get("provider") == "b"
+        assert _span_attrs(b_span).get("model") == "gpt-4o-mini"
+        assert _span_attrs(b_span).get("outcome") == "success"
+        assert _span_attrs(b_span).get("error.type") == "none"
+        # requests_total counts attempts, not requests: two points.
+        requests = _metric_data_points(
+            metric_reader, "chat_completion_requests_total"
+        )
+        assert len(requests) == 2, f"expected 2 attempt hops, got {requests}"
+        assert {p["attrs"].get("provider") for p in requests} == {"a", "b"}
+        # The error counter records only the failed A attempt.
+        errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
+        assert len(errors) == 1
+        assert errors[0]["attrs"].get("provider") == "a"
+        assert errors[0]["attrs"].get("error.type") == "api_error"
+        # The duration histogram records both hops.
+        durations = _metric_data_points(
+            metric_reader, "chat_completion_duration_seconds"
+        )
+        assert len(durations) == 2
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_exhaustion_no_synthetic_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every candidate fails retryably, each attempt records its own
+    error hop and the 503 exhaustion envelope MUST NOT add a synthetic
+    hop: exactly two spans and two ``requests_total`` points (one per
+    attempt), with the error counter matching the attempt count."""
+    counts = {"a": 0, "b": 0}
+
+    def a_handler(request: httpx.Request) -> httpx.Response:
+        counts["a"] += 1
+        return httpx.Response(500, json={"error": "a boom"})
+
+    def b_handler(request: httpx.Request) -> httpx.Response:
+        counts["b"] += 1
+        return httpx.Response(503, json={"error": "b boom"})
+
+    telemetry, span_exporter, metric_reader = _make_chat_telemetry()
+    a, ac = _make_adapter(a_handler)
+    b, bc = _make_adapter(b_handler)
+    a.name = "a"
+    b.name = "b"
+    try:
+        app = _two_candidate_app(monkeypatch, a, b)
+        with TestClient(app) as tc:
+            app.state.telemetry = telemetry
+            response = _post_chat(tc)
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "all_providers_failed"
+        assert counts == {"a": 1, "b": 1}
+        spans = _chat_spans(span_exporter)
+        assert len(spans) == 2, "exhaustion must not add a synthetic hop"
+        assert {_span_attrs(s).get("provider") for s in spans} == {"a", "b"}
+        assert all(_span_attrs(s).get("outcome") == "error" for s in spans)
+        requests = _metric_data_points(
+            metric_reader, "chat_completion_requests_total"
+        )
+        assert len(requests) == 2, f"expected 2 attempt hops, got {requests}"
+        errors = _metric_data_points(metric_reader, "chat_completion_errors_total")
+        assert len(errors) == 2
+    finally:
+        await ac.aclose()
+        await bc.aclose()
