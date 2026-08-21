@@ -1,21 +1,30 @@
 """OpenAI-compatible ``/v1/chat/completions`` async handler.
 
-Routes non-streaming requests to the provider selected by the configured
-:mod:`llmux.core.router` and returns a normalized 200 OpenAI-shaped
-completion envelope, or one of the documented error envelopes
-(``400 ProviderSelectionError`` / ``502 ConfigurationError`` /
-``502 UpstreamError`` / ``504 UpstreamTimeoutError``). An explicit
-``stream=true`` short-circuits to a JSON 501 *before* any provider call
-or telemetry work, preserving the no-fake-SSE contract. The public
-``max_tokens`` field is forwarded to the selected adapter through a
-fixed allowlist (:func:`_allowlist_options`); all other arbitrary
-request extras are accepted by Pydantic but never reach a provider.
+Routes non-streaming requests through the router's ordered candidate
+chain and returns a normalized 200 OpenAI-shaped completion envelope,
+or one of the documented error envelopes (``400 ProviderSelectionError``
+/ ``502 ConfigurationError`` / ``502 UpstreamError`` /
+``504 UpstreamTimeoutError`` / ``503 AllProvidersFailedError``). An
+explicit ``stream=true`` short-circuits to a JSON 501 *before* any
+provider call or telemetry work, preserving the no-fake-SSE contract.
+The public ``max_tokens`` field is forwarded to the selected adapter
+through a fixed allowlist (:func:`_allowlist_options`); all other
+arbitrary request extras are accepted by Pydantic but never reach a
+provider.
 
-Each non-streaming hop is wrapped in a :class:`ChatCompletionTimer` that
+Non-streaming requests attempt each selected candidate exactly once, in
+configured order: first success wins; retryable failures advance; a
+non-retryable typed error stops with its sanitized envelope; exhaustion
+returns the sanitized 503 ``all_providers_failed`` envelope without
+adding a synthetic telemetry hop.
+
+Each attempt is wrapped in its own :class:`ChatCompletionTimer` that
 records one ``chat.completion`` span and three bounded-cardinality
-metrics (``requests_total``, ``errors_total``, ``duration_seconds``).
-Selection misses use the :data:`MODEL_UNKNOWN` sentinel so an unknown
-model never explodes the time-series count. Errors set the span to
+metrics (``requests_total`` counts attempts, ``errors_total``,
+``duration_seconds``): a failed attempt on A followed by success on B
+emits an error hop for A and a success hop for B. Selection misses use
+the :data:`MODEL_UNKNOWN` sentinel so an unknown model never explodes
+the time-series count. Errors set the span to
 ``Status(StatusCode.ERROR, error_type)`` with an ``error.type``
 attribute; the description is the bounded label, never the raw
 exception message or stack trace.
@@ -32,7 +41,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from llmux.core.errors import LLMuxError, to_openai_envelope
 from llmux.core.providers.base import CompletionResult
 from llmux.core.providers.registry import ProviderRegistry
-from llmux.core.router import select_provider
+from llmux.core.router import select_candidates
 from llmux.observability.metrics import (
     MODEL_UNKNOWN,
     PROVIDER_NONE,
@@ -118,7 +127,7 @@ async def post_chat_completion(
       BEFORE the telemetry timer is opened so the rejected path is
       never recorded (per the no-fake-SSE contract).
     - ``stream`` ``False`` (explicit or omitted → Pydantic default) →
-      async first-match ``select_provider`` then ``adapter.complete``
+      async ``select_candidates`` then ``candidates[0].complete``
       wrapped in a :class:`ChatCompletionTimer`. 200 OpenAI-shaped
       envelope on success, sanitized ``LLMuxError`` envelope on typed
       failure. A non-``LLMuxError`` exception is caught by the timer,
@@ -156,7 +165,8 @@ async def post_chat_completion(
             timer.mark_error()
             return _error_response(err)
         try:
-            adapter = await select_provider(body.model, registry)
+            candidates = await select_candidates(body.model, registry)
+            adapter = candidates[0]
         except LLMuxError as exc:
             # model label stays MODEL_UNKNOWN for selection miss so the
             # bounded set never sees the raw request model.

@@ -7,7 +7,7 @@ wiring, and the /v1/models endpoint.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from typing import TypedDict
 from urllib.parse import quote
 
@@ -25,11 +25,13 @@ from starlette.testclient import TestClient
 
 from llmux.config import Settings
 from llmux.core.errors import (
+    AllProvidersFailedError,
     ConfigurationError,
     LLMuxError,
     ProviderSelectionError,
     UpstreamError,
     UpstreamTimeoutError,
+    is_retryable,
     to_openai_envelope,
 )
 from llmux.core.providers.anthropic import AnthropicAdapter
@@ -47,7 +49,7 @@ from llmux.core.providers.registry import (
     RegistryEntry,
     build_providers,
 )
-from llmux.core.router import select_provider
+from llmux.core.router import select_candidates
 from llmux.main import create_app
 from llmux.observability import tracing as tracing_mod
 from llmux.observability.metrics import ChatTelemetry
@@ -160,8 +162,9 @@ def test_openai_settings_invalid_raises_configuration_error(
         (ConfigurationError, 502, "provider_configuration_error", "api_error"),
         (UpstreamError, 502, "upstream_error", "api_error"),
         (UpstreamTimeoutError, 504, "upstream_timeout", "api_error"),
+        (AllProvidersFailedError, 503, "all_providers_failed", "api_error"),
     ],
-    ids=["selection", "config", "upstream", "timeout"],
+    ids=["selection", "config", "upstream", "timeout", "all_failed"],
 )
 def test_errors_envelope_status_and_codes(
     cls: type[LLMuxError], status: int, code: str, type_: str
@@ -198,6 +201,7 @@ def test_errors_envelope_sanitized() -> None:
         ProviderSelectionError,
         UpstreamError,
         UpstreamTimeoutError,
+        AllProvidersFailedError,
     ):
         body = to_openai_envelope(cls(secret))
         serialized = json.dumps(body)
@@ -221,6 +225,82 @@ def test_errors_envelope_unknown_subclass_uses_base_defaults() -> None:
     assert "should-not-leak" not in json.dumps(body)
 
 
+# ----- 1.3 / 1.4 — is_retryable classifier + 503 envelope --------------------
+
+
+class _TypedLLMuxError(LLMuxError):  # noqa: N818
+    """Ad-hoc typed error: neither upstream, selection, nor configuration."""
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        UpstreamTimeoutError("timed out"),
+        UpstreamError("request rate limited", status=408),
+        UpstreamError("request rate limited", status=429),
+        UpstreamError("upstream internal error", status=500),
+        UpstreamError("upstream unavailable", status=503),
+        UpstreamError("transport failure"),
+    ],
+    ids=[
+        "timeout",
+        "status_408",
+        "status_429",
+        "status_500",
+        "status_503",
+        "statusless",
+    ],
+)
+def test_is_retryable_true(error: LLMuxError) -> None:
+    """Timeout, 408/429/5xx, and statusless (transport) errors MUST be
+    retryable so the attempt chain can fail over."""
+    assert is_retryable(error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        UpstreamError("bad request", status=400),
+        UpstreamError("unauthorized", status=401),
+        UpstreamError("not found", status=404),
+        ProviderSelectionError("not available", model="m"),
+        ConfigurationError("bad config"),
+        _TypedLLMuxError("boom"),
+    ],
+    ids=[
+        "status_400",
+        "status_401",
+        "status_404",
+        "selection",
+        "config",
+        "typed_error",
+    ],
+)
+def test_is_retryable_false(error: LLMuxError) -> None:
+    """Other 4xx upstream errors and every non-upstream typed error MUST
+    be non-retryable so the chain stops and surfaces their envelope."""
+    assert is_retryable(error) is False
+
+
+def test_all_providers_failed_envelope_sanitized() -> None:
+    """The all-failed 503 envelope carries the stable code and NEVER leaks
+    raw constructor input, keys, upstream bodies, or stack traces."""
+    err = AllProvidersFailedError(
+        "secret sk-LEAK key, body=<html>no</html>, "
+        "Traceback (most recent call last):\n  File 'x.py', line 1"
+    )
+    assert err.status_code == 503
+    body = to_openai_envelope(err)
+    assert body["error"]["code"] == "all_providers_failed"
+    assert body["error"]["type"] == "api_error"
+    assert body["error"]["param"] is None
+    assert body["error"]["message"] == "All providers failed"
+    serialized = json.dumps(body)
+    for token in ("sk-LEAK", "<html>", "Traceback", "File 'x.py'"):
+        assert token not in serialized, f"envelope leaked {token!r}"
+
+
+
 # ----- 2.1 / 2.2 / 2.3 — OpenAI adapter (httpx.MockTransport) -------------
 
 
@@ -241,7 +321,10 @@ def _ok_payload(content: str = "hello") -> dict[str, object]:
 
 
 def _make_adapter(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: (
+        Callable[[httpx.Request], httpx.Response]
+        | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+    ),
     *,
     models: tuple[str, ...] = ("gpt-4o-mini",),
     base_url: str = "https://api.openai.com/v1",
@@ -1299,7 +1382,7 @@ async def test_build_providers_dispatches_anthropic_slug(
     assert all(c.is_closed and c.aclose_count == 1 for c in clients)
 
 
-# ----- 4.1 / 4.2 — Async first-match select_provider ------------------------
+# ----- 4.1 / 4.2 — Ordered select_candidates ---------------------------------
 
 
 def _make_static_adapter(
@@ -1321,15 +1404,29 @@ def _make_static_adapter(
 
 
 @pytest.mark.asyncio
-async def test_router_first_match_returns_priority_provider() -> None:
-    """First provider in configured order wins for an offered model; no
-    fallback to later providers (spec: first-match, no fallback)."""
+async def test_router_candidates_ordered_a_then_b() -> None:
+    """Both providers offering the model are returned in configured order:
+    A is the primary candidate, B the fallback candidate."""
     a, ac = _make_static_adapter("a", ("shared", "a-only"))
     b, bc = _make_static_adapter("b", ("shared",))
     try:
         registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
-        assert await select_provider("shared", registry) is a
-        assert await select_provider("a-only", registry) is a
+        assert await select_candidates("shared", registry) == (a, b)
+        assert await select_candidates("a-only", registry) == (a,)
+    finally:
+        await ac.aclose()
+        await bc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_router_candidates_exclude_non_matching() -> None:
+    """Providers not offering the model are excluded from the candidate
+    tuple (spec: providers not offering the model are excluded)."""
+    a, ac = _make_static_adapter("a", ("shared",))
+    b, bc = _make_static_adapter("b", ("other-only",))
+    try:
+        registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
+        assert await select_candidates("shared", registry) == (a,)
     finally:
         await ac.aclose()
         await bc.aclose()
@@ -1337,14 +1434,14 @@ async def test_router_first_match_returns_priority_provider() -> None:
 
 @pytest.mark.asyncio
 async def test_router_no_match_raises_provider_selection_error() -> None:
-    """When no provider offers the model, select_provider raises
+    """When no provider offers the model, select_candidates raises
     ProviderSelectionError (envelope → HTTP 400 ``model_not_found``)."""
     a, ac = _make_static_adapter("a", ("m1",))
     b, bc = _make_static_adapter("b", ("m2",))
     try:
         registry = ProviderRegistry((RegistryEntry(a, None), RegistryEntry(b, None)))
         with pytest.raises(ProviderSelectionError):
-            await select_provider("missing", registry)
+            await select_candidates("missing", registry)
     finally:
         await ac.aclose()
         await bc.aclose()
